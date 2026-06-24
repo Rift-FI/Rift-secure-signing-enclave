@@ -69,13 +69,24 @@ The PCR0 of this enclave image is pinned in the KMS CMK's key policy. KMS releas
 
 ## Local development (Mac / Windows)
 
-You can't actually *run* the enclave off a Nitro-capable EC2 — but you can typecheck:
+The crate is split so that 80% of dev happens locally with fast feedback, and only the actual enclave build needs the EC2.
 
-```sh
-make check
-```
+| Command | Where | What it does |
+|---|---|---|
+| `cargo check` | Windows / Mac / Linux | Typecheck. ~5s feedback. Catches the majority of bugs. |
+| `cargo test` | Windows / Mac / Linux | Unit tests for `signing.rs` (sign + recover-pubkey round trip) and `envelope.rs` (AES round trip vs known DEK). |
+| `make eif` | EC2 only | Build the Docker image + convert to EIF. Requires `/dev/nsm` + `nitro-cli`. |
+| `make run-debug` | EC2 only | Boot the enclave + tail console output. |
 
-That runs `cargo check --locked` which catches type errors fast without a full build. For everything else, ssh to the EC2 via SSM Session Manager and run there.
+The split is enforced by `cfg(target_os = "linux")` gates on the modules that touch `/dev/nsm` (`attestation.rs`) and vsock sockets (`vsock_server.rs`). On Windows / Mac those modules don't compile, the binary's `main()` just prints a friendly "build on Linux" message, but the portable modules (`signing.rs`, `envelope.rs`, `protocol.rs`) compile and run their tests fine.
+
+**Recommended inner loop**:
+
+1. Edit code locally in your IDE.
+2. `cargo check` — typecheck.
+3. `cargo test` — run the portable unit tests.
+4. Once satisfied, `git push`.
+5. SSM to the EC2 → `git pull` → `make eif` → measure new PCR0 → run-debug to integration test.
 
 ## Building on the EC2
 

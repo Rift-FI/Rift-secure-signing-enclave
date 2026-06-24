@@ -50,3 +50,55 @@ pub fn sign_user_op_hash(
     output[64] = u8::from(recovery_id) + 27;
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
+
+    // Known test vector: Hardhat's account 0 (well-known dev key).
+    // ANYONE seeing this knows it — never reuse on a live chain.
+    const TEST_PRIVKEY: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2,
+        0xff, 0x80,
+    ];
+    const TEST_HASH: [u8; 32] = [
+        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45,
+        0x67, 0x89,
+    ];
+
+    #[test]
+    fn signs_and_recovers_pubkey() {
+        let sig = sign_user_op_hash(&TEST_PRIVKEY, &TEST_HASH).expect("sign");
+        assert_eq!(sig.len(), 65, "sig must be 65 bytes (r, s, v)");
+        // v ∈ {27, 28}
+        assert!(sig[64] == 27 || sig[64] == 28, "v must be 27 or 28");
+
+        // Verify the signature against the public key.
+        let signing_key = SigningKey::from_bytes((&TEST_PRIVKEY).into()).unwrap();
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let sig_obj = Signature::from_slice(&sig[0..64]).unwrap();
+        verifying_key
+            .verify_prehash(&TEST_HASH, &sig_obj)
+            .expect("signature must verify");
+    }
+
+    #[test]
+    fn rejects_short_key() {
+        let bad_key = [0u8; 31];
+        let result = sign_user_op_hash(&bad_key, &TEST_HASH);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("32 bytes"));
+    }
+
+    #[test]
+    fn rejects_zero_key() {
+        let zero_key = [0u8; 32];
+        let result = sign_user_op_hash(&zero_key, &TEST_HASH);
+        // k256 rejects the all-zeros private key.
+        assert!(result.is_err());
+    }
+}

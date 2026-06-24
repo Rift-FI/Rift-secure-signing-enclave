@@ -16,59 +16,81 @@
 //! attestation documents whose PCR0 matches this enclave's exact image
 //! hash. So even with valid IAM credentials, the parent process cannot
 //! decrypt — only the legit enclave can.
+//!
+//! Platform note: this binary only does useful work on Linux (NSM and
+//! vsock are Linux-only kernel features). On other platforms it
+//! compiles so `cargo check` / `cargo test` work for the portable
+//! crypto modules (`signing`, `envelope`, `protocol`) during local
+//! development, but `main()` exits immediately with a friendly hint.
 
-use anyhow::Context;
-use tracing::{error, info};
-
-mod attestation;
 mod envelope;
 mod protocol;
 mod signing;
+
+#[cfg(target_os = "linux")]
+mod attestation;
+#[cfg(target_os = "linux")]
 mod vsock_server;
 
-/// Vsock port the parent connects to. The parent listens on TCP 443
-/// from the outside world and forwards each request body to us on this
-/// port over the vsock socket.
-const ENCLAVE_VSOCK_PORT: u32 = 5005;
+#[cfg(target_os = "linux")]
+mod linux_main {
+    use super::{attestation, vsock_server};
+    use anyhow::Context;
+    use tracing::{error, info};
 
-/// Vsock CID the parent runs on (3 = parent of the running enclave).
-/// Used when the enclave needs to call back to the parent (KMS proxy).
-const PARENT_CID: u32 = 3;
+    /// Vsock port the parent connects to.
+    pub const ENCLAVE_VSOCK_PORT: u32 = 5005;
+    /// Vsock CID the parent runs on (3 = parent of running enclave).
+    pub const PARENT_CID: u32 = 3;
+    /// Vsock port the parent's KMS-proxy listens on.
+    pub const PARENT_KMS_PROXY_PORT: u32 = 5006;
 
-/// Vsock port the parent's KMS-proxy listens on. The enclave sends
-/// {attestation_doc, wrapped_dek} to this port; the parent calls
-/// KMS Decrypt and returns the CiphertextForRecipient blob.
-const PARENT_KMS_PROXY_PORT: u32 = 5006;
+    pub async fn run() -> anyhow::Result<()> {
+        tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info,rift_signer_enclave=debug".into()),
+            )
+            .init();
+
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            "rift-signer-enclave starting up"
+        );
+
+        attestation::init().context("NSM init failed — is /dev/nsm present? Run inside a real enclave.")?;
+        info!("NSM session initialized");
+
+        vsock_server::serve(ENCLAVE_VSOCK_PORT, PARENT_CID, PARENT_KMS_PROXY_PORT)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, "vsock server terminated unexpectedly");
+                e
+            })?;
+
+        Ok(())
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    // The enclave console (--debug-mode) shows this output. In
-    // production (non-debug enclaves) console output is suppressed.
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,rift_signer_enclave=debug".into()),
-        )
-        .init();
+    #[cfg(target_os = "linux")]
+    {
+        linux_main::run().await
+    }
 
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "rift-signer-enclave starting up"
-    );
-
-    // One-time NSM init. The driver creates a session against /dev/nsm.
-    attestation::init().context("NSM init failed — is /dev/nsm present? Run inside a real enclave.")?;
-    info!("NSM session initialized");
-
-    // Listen for signing requests forever.
-    vsock_server::serve(ENCLAVE_VSOCK_PORT, PARENT_CID, PARENT_KMS_PROXY_PORT)
-        .await
-        .map_err(|e| {
-            error!(error = ?e, "vsock server terminated unexpectedly");
-            e
-        })?;
-
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!(
+            "rift-signer-enclave is a Linux-only binary (requires /dev/nsm + vsock).\n\
+             You can run `cargo check` and `cargo test` on this platform for the\n\
+             portable crypto modules (signing, envelope, protocol), but the real\n\
+             binary must be built and run on the EC2.\n\
+             \n\
+             To build the enclave image: ssh to the EC2, `git pull`, `make eif`."
+        );
+        std::process::exit(2);
+    }
 }

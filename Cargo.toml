@@ -16,15 +16,14 @@ codegen-units = 1      # serialize codegen for deterministic output
 strip = "symbols"      # strip debug symbols; smaller image, smaller PCR0 surface
 panic = "abort"        # no unwinding; smaller binary; enclave dies cleanly on bug
 
+# ─── Cross-platform dependencies ─────────────────────────────────────
+# These compile on Windows / Mac / Linux, so the portable modules
+# (signing.rs, envelope.rs, protocol.rs) can be developed and unit-
+# tested locally with `cargo check` / `cargo test`.
 [dependencies]
-# Async runtime — single-threaded would also work for our throughput, but
-# tokio gives us tokio-vsock + tracing integration for free.
+# Async runtime — required by the main entry point even on non-linux
+# (where it'll print a friendly "build on Linux" message and exit).
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time"] }
-tokio-vsock = "0.5"
-
-# Nitro NSM driver bindings — generates attestation documents.
-# Talks to /dev/nsm which the enclave runtime auto-provides.
-aws-nitro-enclaves-nsm-api = "0.4"
 
 # Symmetric crypto for the envelope payload: AES-256-CBC, same as the
 # backend's encryptKey() output. The DEK comes from KMS attested-decrypt.
@@ -34,15 +33,15 @@ cipher = "0.4"
 
 # Asymmetric crypto:
 # - k256 for secp256k1 signing of the UserOperation hash
-# - rsa for the attestation-key RSA-OAEP unwrap (KMS Decrypt with Recipient
-#   returns the plaintext encrypted under the public key we put in the
-#   attestation doc, so we need to RSA-OAEP-SHA-256 unwrap it in here).
+# - rsa for the attestation-key RSA-OAEP unwrap (KMS Decrypt with
+#   Recipient returns the plaintext encrypted under the public key we
+#   put in the attestation doc, so we RSA-OAEP-SHA-256 unwrap in here).
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 rsa = "0.9"
 sha2 = "0.10"
 sha3 = "0.10"
 
-# Memory hygiene — every plaintext key / DEK gets zeroize'd in a Drop impl.
+# Memory hygiene — every plaintext key / DEK gets zeroize'd on Drop.
 zeroize = { version = "1", features = ["derive"] }
 
 # Serialization for the vsock wire protocol + COSE attestation parsing.
@@ -59,3 +58,11 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# ─── Linux-only deps (real runtime) ──────────────────────────────────
+# These pull in /dev/nsm ioctl + vsock sockets and only compile under
+# Linux. On Windows / Mac the crate still builds — the `attestation`
+# and `vsock_server` modules just become stubs that abort at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.5"
+aws-nitro-enclaves-nsm-api = "0.4"
