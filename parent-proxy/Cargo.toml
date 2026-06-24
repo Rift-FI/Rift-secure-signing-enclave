@@ -1,0 +1,36 @@
+[package]
+name = "rift-parent-proxy"
+description = "Rift parent-proxy — HTTP↔vsock bridge that runs on the EC2 host (NOT in the enclave). Forwards smart-wallet signing requests to the enclave, calls AWS KMS Decrypt-with-Recipient when the enclave asks for unwrap."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "rift-parent-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP server: axum is lightweight + well-supported.
+axum = "0.7"
+tower = "0.5"
+hyper = "1"
+
+# AWS SDK: just KMS. Decrypt-with-Recipient lives in here.
+aws-config = "1"
+aws-sdk-kms = "1"
+
+# Linux-only vsock. Parent only ever runs on the EC2 host (Linux), but
+# we keep the gate so the workspace builds on Windows for development.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.5"

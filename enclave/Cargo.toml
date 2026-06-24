@@ -1,0 +1,39 @@
+[package]
+name = "rift-signer-enclave"
+description = "Rift signing enclave — Nitro Enclaves binary that decrypts envelope-encrypted EOA private keys via KMS attestation and signs Safe UserOp hashes."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "rift-signer-enclave"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-platform deps from the workspace.
+tokio.workspace = true
+aes.workspace = true
+cbc.workspace = true
+cipher.workspace = true
+k256.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+base64.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Linux-only — gated so `cargo check` works on Windows / Mac.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.5"
+aws-nitro-enclaves-nsm-api = "0.4"

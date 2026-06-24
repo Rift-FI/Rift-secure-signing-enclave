@@ -1,46 +1,59 @@
-# Build + deploy targets for the Rift signing enclave.
+# Build + deploy targets for the Rift signing enclave + parent proxy.
 #
-# All targets assume you're running on the c6g.large EC2 with Docker
-# and nitro-cli installed (see step 1.x of the README). Local Mac /
-# Windows dev: use `make check` for a fast cargo type-check; for
-# anything else, ssh to the EC2 (via SSM Session Manager) and run
-# there.
+# All targets except `check`/`test` assume you're running on the
+# c6g.large EC2 with Docker and nitro-cli installed (see step 1.x of
+# the README + DEPLOYMENT.md).
 
 IMAGE := rift-signer-enclave
 TAG ?= latest
 EIF := rift-signer.eif
 
-# How many vCPUs + MiB to give the enclave at run time. c6g.large has
-# 2 vCPU + 4 GiB total; we keep 1 vCPU + 512 MiB for the parent OS.
-# These match the allocator config we set up in step 2.2.
+# Allocator config we set up in step 2.2: 1 vCPU + 1024 MiB to the
+# enclave on c6g.large.
 ENCLAVE_CPUS ?= 1
 ENCLAVE_MEMORY_MIB ?= 1024
 
 .PHONY: help
 help:
 	@echo "Common targets:"
-	@echo "  make check        # cargo check (no full build, fast)"
-	@echo "  make build        # cargo build --release"
-	@echo "  make image        # build the Docker image"
-	@echo "  make eif          # build the enclave image file (EIF)"
-	@echo "  make run-debug    # launch the enclave in debug-mode + tail console"
-	@echo "  make run          # launch the enclave in production mode (no console)"
-	@echo "  make describe     # show running enclaves"
-	@echo "  make kill         # terminate all running enclaves"
-	@echo "  make pcr0         # print the PCR0 of the current EIF (use in KMS key policy)"
-	@echo "  make clean        # remove EIF + cargo target dir"
+	@echo "  make check                   # cargo check (no build, fast)"
+	@echo "  make test                    # unit tests for portable modules"
+	@echo "  make build-enclave           # cargo build --release --bin rift-signer-enclave"
+	@echo "  make build-parent-proxy      # cargo build --release --bin rift-parent-proxy"
+	@echo "  make build                   # both above"
+	@echo "  make image                   # Docker image for the enclave"
+	@echo "  make eif                     # build the EIF (depends on image)"
+	@echo "  make pcr0                    # print the EIF's PCR0 (use in KMS key policy)"
+	@echo "  make run-debug               # launch enclave in debug-mode"
+	@echo "  make run                     # launch enclave in production mode"
+	@echo "  make describe                # show running enclaves"
+	@echo "  make console                 # tail enclave console output"
+	@echo "  make kill                    # terminate all running enclaves"
+	@echo "  make install-parent-proxy    # install parent proxy as systemd unit"
+	@echo "  make clean                   # rm EIF + cargo target dir"
 
 .PHONY: check
 check:
-	cargo check --locked
+	cargo check --locked --workspace
+
+.PHONY: test
+test:
+	cargo test --locked --workspace
+
+.PHONY: build-enclave
+build-enclave:
+	cargo build --release --locked --bin rift-signer-enclave
+
+.PHONY: build-parent-proxy
+build-parent-proxy:
+	cargo build --release --locked --bin rift-parent-proxy
 
 .PHONY: build
-build:
-	cargo build --release --locked
+build: build-enclave build-parent-proxy
 
 .PHONY: image
 image:
-	docker build -t $(IMAGE):$(TAG) .
+	docker build -t $(IMAGE):$(TAG) -f Dockerfile .
 
 .PHONY: eif
 eif: image
@@ -90,6 +103,19 @@ kill:
 	  echo "terminating $$id"; \
 	  sudo nitro-cli terminate-enclave --enclave-id "$$id"; \
 	done
+
+# ─── Parent-proxy systemd install ──────────────────────────────────
+# Builds the parent proxy and installs it as a systemd unit so it
+# survives reboots and restarts the smart-wallet sees timeouts cleanly.
+.PHONY: install-parent-proxy
+install-parent-proxy: build-parent-proxy
+	sudo cp target/release/rift-parent-proxy /usr/local/bin/rift-parent-proxy
+	sudo cp systemd/rift-parent-proxy.service /etc/systemd/system/rift-parent-proxy.service
+	sudo systemctl daemon-reload
+	sudo systemctl enable --now rift-parent-proxy.service
+	@echo "✓ parent-proxy installed and running"
+	@echo "  systemctl status rift-parent-proxy"
+	@echo "  journalctl -u rift-parent-proxy -f"
 
 .PHONY: clean
 clean:

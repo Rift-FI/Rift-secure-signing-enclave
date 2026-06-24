@@ -1,0 +1,37 @@
+[Unit]
+Description=Rift parent-proxy (HTTP↔vsock bridge for the signing enclave)
+Documentation=https://github.com/Rift-FI/Rift-secure-signing-enclave
+After=network-online.target nitro-enclaves-allocator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rift-parent-proxy
+Restart=on-failure
+RestartSec=3
+
+# Hardening — proxy holds no secrets but it does hold IAM credentials
+# for KMS, so minimise the blast radius.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc /usr
+PrivateDevices=false       # need /dev/vsock for the KMS proxy listener
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Env — tune per host. The defaults match the values baked into the
+# enclave binary (port 5005 for signing, 5006 for KMS proxy).
+Environment=AWS_REGION=us-east-1
+Environment=ENCLAVE_PORT=5005
+Environment=KMS_PROXY_PORT=5006
+Environment=HTTP_BIND=127.0.0.1:7777
+# ENCLAVE_CID is set by the start script after launching the enclave
+# (read from `nitro-cli describe-enclaves`). EnvironmentFile is a
+# convenient way to inject it without rewriting the unit.
+EnvironmentFile=-/etc/rift-parent-proxy.env
+
+[Install]
+WantedBy=multi-user.target
