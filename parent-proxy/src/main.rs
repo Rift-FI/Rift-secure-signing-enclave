@@ -41,7 +41,7 @@ use aws_sdk_kms::{
     types::{KeyEncryptionMechanism, RecipientInfo},
     Client as KmsClient,
 };
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -86,7 +86,12 @@ async fn main() -> Result<()> {
         "starting rift-parent-proxy"
     );
 
-    let aws_config = aws_config::from_env().load().await;
+    // Pin the AWS SDK behavior version so future SDK upgrades don't
+    // silently change semantics on us. Switching back to `from_env()`
+    // would trigger a deprecation warning every build.
+    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
     let kms = Arc::new(KmsClient::new(&aws_config));
 
     let state = AppState {
@@ -293,7 +298,7 @@ struct KmsDecryptErr {
 #[cfg(target_os = "linux")]
 async fn run_kms_proxy(port: u32, kms: Arc<KmsClient>) -> Result<()> {
     let addr = VsockAddr::new(u32::MAX, port);
-    let listener = VsockListener::bind(addr).context("vsock bind for KMS proxy")?;
+    let mut listener = VsockListener::bind(addr).context("vsock bind for KMS proxy")?;
     info!(port, "KMS proxy listener ready on vsock");
     loop {
         let (stream, peer) = listener.accept().await.context("vsock accept")?;
