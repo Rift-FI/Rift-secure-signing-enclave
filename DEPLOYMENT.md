@@ -195,6 +195,17 @@ NODE_ENV=production
 PORT=443
 SIGNING_MODE=enclave
 PARENT_PROXY_URL=http://127.0.0.1:7777
+
+# Required for enclave mode — the CMK the enclave will Decrypt against.
+# Sandbox box uses the sandbox CMK; if you ever build a separate prod
+# box, use the prod CMK there.
+KMS_KEY_ARN=arn:aws:kms:us-east-1:957814222213:key/a537dc0f-6010-4ab5-ac63-c1e5b313b640
+
+# Legacy fallback — only needed for users whose encrypted_keys row is
+# still in pre-Phase-0 AES format (i.e. not yet migrated). Same value
+# as the backend's ENCRYPTION_KEY. Drop once bulk migration completes.
+ENCRYPTION_KEY=<same as backend>
+
 # … plus all the Pimlico bundler URLs etc. from your existing Railway smart-wallet env
 EOF
 
@@ -317,7 +328,7 @@ This is the only "zero-downtime + rollback-safe" pattern for attested enclaves. 
 
 ## Open follow-ups
 
-- [ ] Refactor the 6 callsites in smart-wallet (`abstraction.ts` ×2, `relay.ts` ×2, `estimateBridge.ts`, `estimateTransfer.ts`) to use `makeSigner({...})` from `signerFactory.ts` instead of `privateKeyToAccount(...)` directly. Mechanical 1-line change per site. Tracked as `TODO(rift-1.2)`.
+- [x] ~~Refactor the smart-wallet signing sites to use `makeSigner({...})`~~ — **done.** `abstraction.ts:submitTransaction` and `abstraction.ts:submitUniversalTransaction` now both call `makeSigner`, and `routes.ts` threads `req.body.ownerEncryptedKey` + `process.env.KMS_KEY_ARN` through. The other 4 sites originally on the list (`relay.ts` ×2, `estimateBridge.ts`, `estimateTransfer.ts`) turned out to either use a stub signer for fee estimation or live in the v2 client-side-sign flow that doesn't touch keys, so they didn't need refactoring.
 - [ ] Replace the silent fallback-to-local in `signerFactory.makeSigner` with a hard error before declaring GA. Today it falls back to keep the rollout safe; once Phase 1 is stable, the enclave should be the only signing path.
 - [ ] Wire CloudWatch alarms on parent-proxy 5xx rates so an enclave problem pages the on-call instead of silently exhausting the circuit breaker.
 - [ ] Multi-AZ standby (second EC2 + same PCR0, ALB).
