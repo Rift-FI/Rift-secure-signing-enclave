@@ -42,11 +42,11 @@ test:
 
 .PHONY: build-enclave
 build-enclave:
-	cargo build --release --locked --bin rift-signer-enclave
+	cargo build --release --bin rift-signer-enclave
 
 .PHONY: build-parent-proxy
 build-parent-proxy:
-	cargo build --release --locked --bin rift-parent-proxy
+	cargo build --release --bin rift-parent-proxy
 
 .PHONY: build
 build: build-enclave build-parent-proxy
