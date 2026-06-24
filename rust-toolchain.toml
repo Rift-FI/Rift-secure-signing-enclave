@@ -1,0 +1,10 @@
+# Pin the toolchain so every build of this enclave produces the same
+# PCR0 measurement. Any change here changes the binary, the EIF, and
+# the KMS key policy condition. Treat updates here as you would treat
+# a deployment cutover (build new EIF, add new PCR0 to key policy,
+# cutover traffic, remove old PCR0).
+
+[toolchain]
+channel = "1.83.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

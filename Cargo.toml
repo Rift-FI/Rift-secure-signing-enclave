@@ -1,0 +1,61 @@
+[package]
+name = "rift-signer-enclave"
+version = "0.1.0"
+edition = "2021"
+description = "Rift signing enclave — Nitro Enclaves binary that decrypts envelope-encrypted EOA private keys via KMS attestation and signs Safe UserOp hashes."
+license = "PROPRIETARY"
+authors = ["Rift Finance"]
+
+# Reproducible build settings — important for stable PCR0 across rebuilds.
+# We pin the rust toolchain in rust-toolchain.toml and forbid features
+# that would inject build-host-specific bytes into the binary.
+[profile.release]
+opt-level = 3
+lto = "fat"            # whole-program optimization; smaller binary, more deterministic
+codegen-units = 1      # serialize codegen for deterministic output
+strip = "symbols"      # strip debug symbols; smaller image, smaller PCR0 surface
+panic = "abort"        # no unwinding; smaller binary; enclave dies cleanly on bug
+
+[dependencies]
+# Async runtime — single-threaded would also work for our throughput, but
+# tokio gives us tokio-vsock + tracing integration for free.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time"] }
+tokio-vsock = "0.5"
+
+# Nitro NSM driver bindings — generates attestation documents.
+# Talks to /dev/nsm which the enclave runtime auto-provides.
+aws-nitro-enclaves-nsm-api = "0.4"
+
+# Symmetric crypto for the envelope payload: AES-256-CBC, same as the
+# backend's encryptKey() output. The DEK comes from KMS attested-decrypt.
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
+cipher = "0.4"
+
+# Asymmetric crypto:
+# - k256 for secp256k1 signing of the UserOperation hash
+# - rsa for the attestation-key RSA-OAEP unwrap (KMS Decrypt with Recipient
+#   returns the plaintext encrypted under the public key we put in the
+#   attestation doc, so we need to RSA-OAEP-SHA-256 unwrap it in here).
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+rsa = "0.9"
+sha2 = "0.10"
+sha3 = "0.10"
+
+# Memory hygiene — every plaintext key / DEK gets zeroize'd in a Drop impl.
+zeroize = { version = "1", features = ["derive"] }
+
+# Serialization for the vsock wire protocol + COSE attestation parsing.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+ciborium = "0.2"        # COSE_Sign1 attestation parsing
+base64 = "0.22"
+hex = "0.4"
+
+# Error plumbing + logs to enclave console (debug-mode visible via
+# nitro-cli console).
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
