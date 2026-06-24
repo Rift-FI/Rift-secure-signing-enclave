@@ -38,7 +38,14 @@ COPY parent-proxy/src parent-proxy/src
 
 # Build ONLY the enclave binary for this image — parent-proxy is built
 # separately and runs on the EC2 host outside the enclave.
-RUN cargo build --release --locked --bin rift-signer-enclave
+#
+# `--locked` is intentionally OMITTED here for now: when Cargo.toml
+# changes (new deps added) the committed Cargo.lock may lag by one
+# commit, and the Docker build context doesn't see the in-place lock
+# regeneration that `make eif` could otherwise do. Re-add `--locked`
+# once dep changes settle down and the workflow is consistently
+# "commit Cargo.toml + Cargo.lock together."
+RUN cargo build --release --bin rift-signer-enclave
 
 # Verify the binary exists.
 RUN ls -la /build/target/release/rift-signer-enclave
