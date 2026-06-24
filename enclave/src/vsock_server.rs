@@ -22,18 +22,25 @@
 //!   7. Zeroize the DEK and the plaintext key buffers.
 //!   8. Return the 65-byte (r, s, v) signature hex-encoded.
 
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use cms::content_info::ContentInfo;
+use cms::enveloped_data::{EnvelopedData, RecipientInfo};
+use der::{Decode, Encode};
 use rand::RngCore;
-use rsa::{
-    pkcs8::EncodePublicKey,
-    Oaep, RsaPrivateKey, RsaPublicKey,
-};
+use rsa::{pkcs8::EncodePublicKey, Oaep, RsaPrivateKey, RsaPublicKey};
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 use tracing::{error, info, info_span, warn, Instrument};
 use zeroize::Zeroize;
+
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+
+/// OID of AES-256-CBC content encryption. KMS uses this for the
+/// EncryptedContentInfo inside the CMS EnvelopedData it returns.
+const AES_256_CBC_OID: &str = "2.16.840.1.101.3.4.1.42";
 
 use crate::{
     attestation, envelope,
@@ -139,14 +146,21 @@ async fn process(
         .decode(&ciphertext_for_recipient_b64)
         .context("base64-decode CiphertextForRecipient")?;
 
-    // ─── 4. RSA-OAEP-SHA-256 unwrap → plaintext DEK ─────────────────
-    let mut dek = rsa_priv
-        .decrypt(Oaep::new::<Sha256>(), &ciphertext_for_recipient)
-        .map_err(|e| anyhow!("RSA-OAEP unwrap of CiphertextForRecipient failed: {e:?}"))?;
+    // ─── 4. CMS EnvelopedData unwrap → plaintext DEK ─────────────────
+    // KMS returns a PKCS#7 / CMS EnvelopedData structure (RFC 5652),
+    // NOT a raw RSA-OAEP ciphertext. The structure contains:
+    //   - one or more RecipientInfos, each holding a content-encryption-
+    //     key (CEK) encrypted to a specific public key (ours, by RSA-OAEP)
+    //   - an EncryptedContentInfo holding the actual plaintext DEK
+    //     encrypted to the CEK by AES-256-CBC.
+    // So we: parse CMS → extract our KeyTransRecipientInfo → RSA-OAEP
+    // unwrap the CEK → AES-256-CBC decrypt the encrypted content with
+    // that CEK → that decrypted blob is the plaintext DEK we asked KMS
+    // to decrypt for us.
+    let mut dek = cms_unwrap_data_key(&rsa_priv, &ciphertext_for_recipient)
+        .context("CMS unwrap of KMS CiphertextForRecipient")?;
 
     if dek.len() != 32 {
-        // Make sure we wipe whatever weird-length plaintext we got
-        // before we bail.
         dek.zeroize();
         bail!("unwrapped DEK has unexpected length {} (want 32)", dek.len());
     }
@@ -234,4 +248,80 @@ async fn write_frame<T: serde::Serialize>(stream: &mut VsockStream, value: &T) -
     stream.write_all(&body).await.context("write frame body")?;
     stream.flush().await.context("flush")?;
     Ok(())
+}
+
+// ─── CMS EnvelopedData unwrap ───────────────────────────────────────
+//
+// Mirrors what the AWS Nitro Enclaves SDK does in C with
+// `CMS_decrypt(cms_info, NULL, pkey, NULL, plaintext_bio, 0)` —
+// just hand-written in pure Rust against the `cms` + `der` crates so
+// we don't have to drag the entire openssl dep tree into the enclave
+// binary (small attack surface = stable PCR0).
+fn cms_unwrap_data_key(rsa_priv: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    // The outer ContentInfo wraps EnvelopedData. Pull it out.
+    let ci = ContentInfo::from_der(ciphertext).context("parse CMS ContentInfo")?;
+    let enveloped_der = ci.content.to_der().context("encode CMS content for re-parse")?;
+    let ed = EnvelopedData::from_der(&enveloped_der).context("parse EnvelopedData")?;
+
+    // Find the KeyTransRecipientInfo. KMS produces exactly one (for
+    // the enclave's public key) — we just take the first KTRI.
+    let ktri = ed
+        .recip_infos
+        .0
+        .iter()
+        .find_map(|r| match r {
+            RecipientInfo::Ktri(k) => Some(k),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("no KeyTransRecipientInfo in CMS EnvelopedData"))?;
+
+    // RSA-OAEP-SHA-256 unwrap the content-encryption key (CEK).
+    let encrypted_cek = ktri.enc_key.as_bytes();
+    let cek = rsa_priv
+        .decrypt(Oaep::new::<Sha256>(), encrypted_cek)
+        .map_err(|e| anyhow!("RSA-OAEP unwrap of CEK failed: {e:?}"))?;
+    if cek.len() != 32 {
+        bail!("CEK has unexpected length {} (want 32 for AES-256)", cek.len());
+    }
+
+    // Pull the encrypted content + algorithm OID + IV out of the
+    // EncryptedContentInfo. KMS always uses AES-256-CBC here per the
+    // RFC 5652 + AWS docs; reject anything else as a defensive measure.
+    let eci = &ed.encrypted_content;
+    let alg_oid = eci.content_enc_alg.oid.to_string();
+    if alg_oid != AES_256_CBC_OID {
+        bail!(
+            "unexpected content_enc_alg OID {} (want AES-256-CBC {})",
+            alg_oid,
+            AES_256_CBC_OID
+        );
+    }
+
+    // For AES-CBC the AlgorithmIdentifier.parameters is an ASN.1
+    // OCTET STRING of the IV (16 bytes).
+    let params = eci
+        .content_enc_alg
+        .parameters
+        .as_ref()
+        .ok_or_else(|| anyhow!("AES-CBC algorithm parameters (IV) missing"))?;
+    let params_der = params.to_der().context("encode AES params back to DER")?;
+    let iv_octet =
+        der::asn1::OctetString::from_der(&params_der).context("parse AES-CBC IV octet string")?;
+    let iv_bytes = iv_octet.as_bytes();
+    if iv_bytes.len() != 16 {
+        bail!("AES-CBC IV must be 16 bytes, got {}", iv_bytes.len());
+    }
+
+    let encrypted_content = eci
+        .encrypted_content
+        .as_ref()
+        .ok_or_else(|| anyhow!("EncryptedContentInfo.encrypted_content missing"))?
+        .as_bytes();
+
+    let decryptor = Aes256CbcDec::new(cek.as_slice().into(), iv_bytes.into());
+    let plaintext = decryptor
+        .decrypt_padded_vec_mut::<Pkcs7>(encrypted_content)
+        .map_err(|e| anyhow!("AES-256-CBC decrypt of CMS content failed: {e:?}"))?;
+
+    Ok(plaintext)
 }

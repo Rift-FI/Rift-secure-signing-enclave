@@ -37,3 +37,13 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.5"
 aws-nitro-enclaves-nsm-api = "0.4"
+
+# CMS / PKCS#7 EnvelopedData parsing for KMS CiphertextForRecipient.
+# KMS Decrypt with the Recipient parameter wraps the plaintext-encrypted-
+# to-the-attestation-public-key inside a CMS EnvelopedData structure (per
+# RFC 5652) — the C SDK uses OpenSSL's CMS_decrypt for this. In Rust we
+# parse the CMS with the pure-Rust `cms` crate, then do the RSA-OAEP +
+# AES-CBC steps ourselves with the deps we already have.
+cms = "0.2"
+const-oid = "0.9"
+der = "0.7"
