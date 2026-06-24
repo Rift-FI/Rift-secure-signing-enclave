@@ -60,6 +60,10 @@ const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7777";
 struct AppState {
     enclave_cid: u32,
     enclave_port: u32,
+    // Kept on the state even though sign_handler currently goes
+    // through vsock only — when we add a `/keygen` endpoint in Phase 2
+    // the HTTP handler will call KMS directly via this client.
+    #[allow(dead_code)]
     kms: Arc<KmsClient>,
 }
 
@@ -260,14 +264,6 @@ struct KmsDecryptRequest {
     attestation_doc_b64: String,
     wrapped_dek_b64: String,
     kms_key_arn: String,
-}
-
-/// Same shape as enclave's `protocol::KmsDecryptResponse`.
-#[derive(Serialize)]
-#[serde(tag = "tag", content = "content")]
-enum KmsDecryptResponseSerialized {
-    Ok { ciphertext_for_recipient_b64: String },
-    Err { reason: String },
 }
 
 // Match enclave's `enum KmsDecryptResponse { Ok { ... }, Err { ... } }`

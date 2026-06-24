@@ -47,7 +47,7 @@ pub async fn serve(
     parent_kms_proxy_port: u32,
 ) -> Result<()> {
     let addr = VsockAddr::new(u32::MAX, vsock_port);
-    let listener = VsockListener::bind(addr)
+    let mut listener = VsockListener::bind(addr)
         .context("vsock bind failed — is the enclave running with vsock support?")?;
     info!(port = vsock_port, "listening for signing requests on vsock");
 
