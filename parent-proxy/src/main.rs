@@ -41,7 +41,14 @@ use aws_sdk_kms::{
     types::{KeyEncryptionMechanism, RecipientInfo},
     Client as KmsClient,
 };
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::post,
+    Json, Router,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -54,7 +61,10 @@ use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 const DEFAULT_ENCLAVE_CID: u32 = 16;
 const DEFAULT_ENCLAVE_PORT: u32 = 5005;
 const DEFAULT_KMS_PROXY_PORT: u32 = 5006;
-const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7777";
+// Public by default so Railway smart-wallet can reach us. When you
+// want to keep this proxy localhost-only (smart-wallet on the same
+// host), set HTTP_BIND=127.0.0.1:7777 in the systemd env file.
+const DEFAULT_HTTP_BIND: &str = "0.0.0.0:7777";
 
 #[derive(Clone)]
 struct AppState {
@@ -118,8 +128,13 @@ async fn main() -> Result<()> {
     }
 
     // ─── HTTP signing frontend ──────────────────────────────────────
+    // Bearer-token auth middleware on /sign. Layered AFTER the health
+    // route so /health stays open for load-balancer probes etc.
     let app = Router::new()
-        .route("/sign", post(sign_handler))
+        .route(
+            "/sign",
+            post(sign_handler).route_layer(middleware::from_fn(bearer_auth)),
+        )
         .route("/health", post(health_handler))
         .route("/health", axum::routing::get(health_handler))
         .with_state(state);
@@ -168,6 +183,42 @@ struct SignError {
 
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+/// Bearer-token auth — reads the expected secret from
+/// `PARENT_PROXY_AUTH_TOKEN` env at request time so a rotation
+/// (write new env, `systemctl restart rift-parent-proxy`) takes
+/// effect without rebuilding.
+///
+/// When the env var is unset/empty, auth is DISABLED. This keeps
+/// `make run-debug` + curl-smoke-test ergonomic on the EC2 itself
+/// (parent-proxy listening on localhost, no public exposure yet).
+/// Setting the env var locks down /sign immediately on next restart.
+async fn bearer_auth(
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<SignError>)> {
+    let expected = std::env::var("PARENT_PROXY_AUTH_TOKEN").unwrap_or_default();
+    if expected.is_empty() {
+        return Ok(next.run(req).await);
+    }
+    let header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let want = format!("Bearer {expected}");
+    if header == want {
+        Ok(next.run(req).await)
+    } else {
+        warn!("rejected /sign request — missing or wrong Bearer token");
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(SignError {
+                error: "unauthorized".to_string(),
+            }),
+        ))
+    }
 }
 
 async fn sign_handler(

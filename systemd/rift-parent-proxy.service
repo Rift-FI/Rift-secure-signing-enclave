@@ -27,10 +27,20 @@ ProtectControlGroups=true
 Environment=AWS_REGION=us-east-1
 Environment=ENCLAVE_PORT=5005
 Environment=KMS_PROXY_PORT=5006
-Environment=HTTP_BIND=127.0.0.1:7777
-# ENCLAVE_CID is set by the start script after launching the enclave
-# (read from `nitro-cli describe-enclaves`). EnvironmentFile is a
-# convenient way to inject it without rewriting the unit.
+# HTTP_BIND defaults to 0.0.0.0:7777 in the binary so the parent-proxy
+# is reachable from off-host (nginx in front terminates TLS + filters
+# by hostname). Override to 127.0.0.1:7777 if you want it host-local
+# only — useful when running the smoke-test curl on the box itself
+# without exposing the port at all.
+#
+# PARENT_PROXY_AUTH_TOKEN, when set, gates /sign with
+# `Authorization: Bearer <token>`. Strongly recommended whenever
+# HTTP_BIND is non-localhost. Smart-wallet on Railway sends the same
+# value in its `Authorization` header.
+#
+# Both env vars are intentionally set in the env file (not the unit)
+# so rotating the token is `vi /etc/rift-parent-proxy.env` +
+# `systemctl restart rift-parent-proxy` with no git churn.
 EnvironmentFile=-/etc/rift-parent-proxy.env
 
 [Install]
