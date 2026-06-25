@@ -80,3 +80,68 @@ pub enum KmsDecryptResponse {
         reason: String,
     },
 }
+
+// ─── Wallet generation (Phase 2) ────────────────────────────────────
+//
+// New op: backend → parent-proxy /generate-wallet → enclave. Asks
+// the enclave to generate a fresh secp256k1 EOA, wrap its private
+// key in a KMS envelope (via kms:GenerateDataKey + Recipient
+// attestation), and return:
+//   - envelope_blob: `enc:v1:<wrapped_dek_b64>:<iv_hex>:<ct_hex>`
+//   - owner_address: 0x-prefixed Ethereum address (keccak256 of
+//     uncompressed pubkey[1..], last 20 bytes)
+// The plaintext private key NEVER leaves the enclave.
+
+/// Parent → Enclave: generate a brand-new EOA and return its envelope.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateWalletRequest {
+    /// CMK to wrap the freshly-generated DEK with. Same key the
+    /// existing signing path uses — the enclave doesn't have to know
+    /// which one (parent routes the KMS call).
+    pub kms_key_arn: String,
+}
+
+/// Enclave → Parent: the new EOA's envelope blob + public address.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum GenerateWalletResponse {
+    Ok {
+        /// `enc:v1:<wrapped_dek_b64>:<iv_hex>:<ciphertext_hex>` — the
+        /// same shape backend's `encryptKey()` produces, so the smart-
+        /// wallet's `decryptKey` reads it without modification.
+        envelope_blob: String,
+        /// 0x-prefixed lowercase EOA address.
+        owner_address: String,
+    },
+    Err {
+        reason: String,
+    },
+}
+
+/// Enclave → Parent (KMS proxy port): "please call kms:GenerateDataKey
+/// with this attestation doc and return BOTH the CiphertextBlob (KMS-
+/// wrapped DEK to store in the envelope) AND CiphertextForRecipient
+/// (RSA-OAEP'd plaintext DEK for the enclave to unwrap)."
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KmsGenerateDataKeyRequest {
+    /// COSE_Sign1 attestation document, base64-encoded.
+    pub attestation_doc_b64: String,
+    /// The CMK ARN.
+    pub kms_key_arn: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum KmsGenerateDataKeyResponse {
+    Ok {
+        /// Base64 of the KMS-wrapped DEK — stored verbatim in the
+        /// envelope as `wrapped_dek_b64`.
+        ciphertext_blob_b64: String,
+        /// Base64 of CiphertextForRecipient — RSA-OAEP-SHA-256
+        /// encrypted under the public key embedded in the
+        /// attestation document. The enclave RSA-unwraps to get the
+        /// plaintext DEK.
+        ciphertext_for_recipient_b64: String,
+    },
+    Err {
+        reason: String,
+    },
+}

@@ -38,12 +38,16 @@ mod linux_main {
     use anyhow::Context;
     use tracing::{error, info};
 
-    /// Vsock port the parent connects to.
+    /// Vsock port the parent connects to for signing requests.
     pub const ENCLAVE_VSOCK_PORT: u32 = 5005;
     /// Vsock CID the parent runs on (3 = parent of running enclave).
     pub const PARENT_CID: u32 = 3;
     /// Vsock port the parent's KMS-proxy listens on.
     pub const PARENT_KMS_PROXY_PORT: u32 = 5006;
+    /// Phase 2 — vsock port for wallet-generation requests. Separate
+    /// from the sign port so a hung sign connection can't starve account
+    /// creation and vice versa.
+    pub const ENCLAVE_GENERATE_WALLET_PORT: u32 = 5007;
 
     pub async fn run() -> anyhow::Result<()> {
         tracing_subscriber::fmt()
@@ -63,12 +67,17 @@ mod linux_main {
         attestation::init().context("NSM init failed — is /dev/nsm present? Run inside a real enclave.")?;
         info!("NSM session initialized");
 
-        vsock_server::serve(ENCLAVE_VSOCK_PORT, PARENT_CID, PARENT_KMS_PROXY_PORT)
-            .await
-            .map_err(|e| {
-                error!(error = ?e, "vsock server terminated unexpectedly");
-                e
-            })?;
+        vsock_server::serve(
+            ENCLAVE_VSOCK_PORT,
+            ENCLAVE_GENERATE_WALLET_PORT,
+            PARENT_CID,
+            PARENT_KMS_PROXY_PORT,
+        )
+        .await
+        .map_err(|e| {
+            error!(error = ?e, "vsock server terminated unexpectedly");
+            e
+        })?;
 
         Ok(())
     }

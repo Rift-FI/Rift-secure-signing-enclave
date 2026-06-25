@@ -61,6 +61,7 @@ use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 const DEFAULT_ENCLAVE_CID: u32 = 16;
 const DEFAULT_ENCLAVE_PORT: u32 = 5005;
 const DEFAULT_KMS_PROXY_PORT: u32 = 5006;
+const DEFAULT_GENERATE_WALLET_PORT: u32 = 5007;
 // Public by default so Railway smart-wallet can reach us. When you
 // want to keep this proxy localhost-only (smart-wallet on the same
 // host), set HTTP_BIND=127.0.0.1:7777 in the systemd env file.
@@ -70,9 +71,10 @@ const DEFAULT_HTTP_BIND: &str = "0.0.0.0:7777";
 struct AppState {
     enclave_cid: u32,
     enclave_port: u32,
-    // Kept on the state even though sign_handler currently goes
-    // through vsock only — when we add a `/keygen` endpoint in Phase 2
-    // the HTTP handler will call KMS directly via this client.
+    /// Phase 2 — separate vsock port for wallet generation. Decoupled
+    /// from the sign port so a hung signing request doesn't starve
+    /// account creation and vice versa.
+    enclave_generate_wallet_port: u32,
     #[allow(dead_code)]
     kms: Arc<KmsClient>,
 }
@@ -89,12 +91,17 @@ async fn main() -> Result<()> {
 
     let enclave_cid = env_u32("ENCLAVE_CID", DEFAULT_ENCLAVE_CID);
     let enclave_port = env_u32("ENCLAVE_PORT", DEFAULT_ENCLAVE_PORT);
+    let enclave_generate_wallet_port = env_u32(
+        "ENCLAVE_GENERATE_WALLET_PORT",
+        DEFAULT_GENERATE_WALLET_PORT,
+    );
     let kms_proxy_port = env_u32("KMS_PROXY_PORT", DEFAULT_KMS_PROXY_PORT);
     let http_bind = std::env::var("HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.to_string());
 
     info!(
         enclave_cid,
         enclave_port,
+        enclave_generate_wallet_port,
         kms_proxy_port,
         http_bind = %http_bind,
         "starting rift-parent-proxy"
@@ -111,6 +118,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         enclave_cid,
         enclave_port,
+        enclave_generate_wallet_port,
         kms: kms.clone(),
     };
 
@@ -134,6 +142,10 @@ async fn main() -> Result<()> {
         .route(
             "/sign",
             post(sign_handler).route_layer(middleware::from_fn(bearer_auth)),
+        )
+        .route(
+            "/generate-wallet",
+            post(generate_wallet_handler).route_layer(middleware::from_fn(bearer_auth)),
         )
         .route("/health", post(health_handler))
         .route("/health", axum::routing::get(health_handler))
@@ -307,7 +319,112 @@ async fn forward_to_enclave(
     Ok(resp)
 }
 
+// ─── /generate-wallet HTTP handler ──────────────────────────────────
+
+/// JSON body the backend sends to POST /generate-wallet.
+#[derive(Debug, Deserialize)]
+struct GenerateWalletBody {
+    /// CMK to wrap the freshly-generated DEK with.
+    kms_key_arn: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerateWalletSuccess {
+    envelope_blob: String,
+    owner_address: String,
+}
+
+async fn generate_wallet_handler(
+    State(state): State<AppState>,
+    Json(body): Json<GenerateWalletBody>,
+) -> Result<Json<GenerateWalletSuccess>, (StatusCode, Json<SignError>)> {
+    #[cfg(target_os = "linux")]
+    {
+        let enclave_req = serde_json::json!({
+            "kms_key_arn": body.kms_key_arn,
+        });
+
+        match forward_to_enclave(
+            state.enclave_cid,
+            state.enclave_generate_wallet_port,
+            &enclave_req,
+        )
+        .await
+        {
+            Ok(resp) => {
+                if let Some(ok) = resp.get("Ok") {
+                    let envelope_blob = ok
+                        .get("envelope_blob")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let owner_address = ok
+                        .get("owner_address")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if envelope_blob.is_empty() || owner_address.is_empty() {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            Json(SignError {
+                                error: format!("malformed enclave response: {resp}"),
+                            }),
+                        ));
+                    }
+                    Ok(Json(GenerateWalletSuccess {
+                        envelope_blob,
+                        owner_address,
+                    }))
+                } else if let Some(err) = resp
+                    .get("Err")
+                    .and_then(|e| e.get("reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    warn!(reason = %err, "enclave generate-wallet returned error");
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(SignError {
+                            error: format!("enclave: {err}"),
+                        }),
+                    ))
+                } else {
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(SignError {
+                            error: format!("malformed enclave response: {resp}"),
+                        }),
+                    ))
+                }
+            }
+            Err(e) => {
+                error!(error = ?e, "forward to enclave (generate-wallet) failed");
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(SignError {
+                        error: format!("forward to enclave: {e:#}"),
+                    }),
+                ))
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, body);
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SignError {
+                error: "parent proxy only runs on Linux".to_string(),
+            }),
+        ))
+    }
+}
+
 // ─── vsock KMS proxy ────────────────────────────────────────────────
+//
+// Phase 2: requests carry an `op` discriminator. Two ops today:
+//   - "Decrypt"        — kms:Decrypt with attestation Recipient
+//   - "GenerateDataKey" — kms:GenerateDataKey with attestation Recipient
 
 /// Same shape as enclave's `protocol::KmsDecryptRequest`.
 #[derive(Deserialize)]
@@ -317,8 +434,22 @@ struct KmsDecryptRequest {
     kms_key_arn: String,
 }
 
-// Match enclave's `enum KmsDecryptResponse { Ok { ... }, Err { ... } }`
-// serialization (serde's default for unit-tagged enums).
+#[derive(Deserialize)]
+struct KmsGenerateDataKeyRequest {
+    attestation_doc_b64: String,
+    kms_key_arn: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op")]
+enum KmsProxyRequest {
+    Decrypt(KmsDecryptRequest),
+    GenerateDataKey(KmsGenerateDataKeyRequest),
+}
+
+// Response variants. Wire shape matches the enclave's
+// `enum KmsDecryptResponse` / `enum KmsGenerateDataKeyResponse`
+// (serde default for unit-tagged enums: `{ "Ok": {...} }` / `{ "Err": {...} }`).
 #[derive(Serialize)]
 #[serde(untagged)]
 enum KmsDecryptResponse {
@@ -328,7 +459,7 @@ enum KmsDecryptResponse {
     },
     Err {
         #[serde(rename = "Err")]
-        err: KmsDecryptErr,
+        err: KmsErr,
     },
 }
 
@@ -338,7 +469,26 @@ struct KmsDecryptOk {
 }
 
 #[derive(Serialize)]
-struct KmsDecryptErr {
+#[serde(untagged)]
+enum KmsGenerateDataKeyResponse {
+    Ok {
+        #[serde(rename = "Ok")]
+        ok: KmsGenerateDataKeyOk,
+    },
+    Err {
+        #[serde(rename = "Err")]
+        err: KmsErr,
+    },
+}
+
+#[derive(Serialize)]
+struct KmsGenerateDataKeyOk {
+    ciphertext_blob_b64: String,
+    ciphertext_for_recipient_b64: String,
+}
+
+#[derive(Serialize)]
+struct KmsErr {
     reason: String,
 }
 
@@ -361,22 +511,42 @@ async fn run_kms_proxy(port: u32, kms: Arc<KmsClient>) -> Result<()> {
 #[cfg(target_os = "linux")]
 async fn handle_kms_proxy_conn(mut stream: VsockStream, kms: Arc<KmsClient>) -> Result<()> {
     let req_bytes = read_frame(&mut stream).await?;
-    let req: KmsDecryptRequest = serde_json::from_slice(&req_bytes)?;
+    let req: KmsProxyRequest = serde_json::from_slice(&req_bytes)?;
 
-    let response = match call_kms_decrypt(&kms, &req).await {
-        Ok(ciphertext_for_recipient) => KmsDecryptResponse::Ok {
-            ok: KmsDecryptOk {
-                ciphertext_for_recipient_b64: B64.encode(&ciphertext_for_recipient),
-            },
-        },
-        Err(e) => KmsDecryptResponse::Err {
-            err: KmsDecryptErr {
-                reason: format!("{e:#}"),
-            },
-        },
+    let body = match req {
+        KmsProxyRequest::Decrypt(req) => {
+            let response = match call_kms_decrypt(&kms, &req).await {
+                Ok(ciphertext_for_recipient) => KmsDecryptResponse::Ok {
+                    ok: KmsDecryptOk {
+                        ciphertext_for_recipient_b64: B64.encode(&ciphertext_for_recipient),
+                    },
+                },
+                Err(e) => KmsDecryptResponse::Err {
+                    err: KmsErr {
+                        reason: format!("{e:#}"),
+                    },
+                },
+            };
+            serde_json::to_vec(&response)?
+        }
+        KmsProxyRequest::GenerateDataKey(req) => {
+            let response = match call_kms_generate_data_key(&kms, &req).await {
+                Ok((blob, cfr)) => KmsGenerateDataKeyResponse::Ok {
+                    ok: KmsGenerateDataKeyOk {
+                        ciphertext_blob_b64: B64.encode(&blob),
+                        ciphertext_for_recipient_b64: B64.encode(&cfr),
+                    },
+                },
+                Err(e) => KmsGenerateDataKeyResponse::Err {
+                    err: KmsErr {
+                        reason: format!("{e:#}"),
+                    },
+                },
+            };
+            serde_json::to_vec(&response)?
+        }
     };
 
-    let body = serde_json::to_vec(&response)?;
     write_frame(&mut stream, &body).await?;
     Ok(())
 }
@@ -407,6 +577,41 @@ async fn call_kms_decrypt(kms: &KmsClient, req: &KmsDecryptRequest) -> Result<Ve
         .ciphertext_for_recipient
         .ok_or_else(|| anyhow!("KMS returned no CiphertextForRecipient — was attestation valid?"))?;
     Ok(cfr.into_inner())
+}
+
+/// Calls kms:GenerateDataKey with the recipient attestation. Returns
+/// (CiphertextBlob, CiphertextForRecipient).
+async fn call_kms_generate_data_key(
+    kms: &KmsClient,
+    req: &KmsGenerateDataKeyRequest,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let attestation_doc = B64
+        .decode(&req.attestation_doc_b64)
+        .context("base64-decode attestation document")?;
+
+    let recipient = RecipientInfo::builder()
+        .attestation_document(Blob::new(attestation_doc))
+        .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
+        .build();
+
+    let out = kms
+        .generate_data_key()
+        .key_id(&req.kms_key_arn)
+        .key_spec(aws_sdk_kms::types::DataKeySpec::Aes256)
+        .recipient(recipient)
+        .send()
+        .await
+        .context("KMS GenerateDataKey with Recipient")?;
+
+    let blob = out
+        .ciphertext_blob
+        .ok_or_else(|| anyhow!("KMS returned no CiphertextBlob"))?
+        .into_inner();
+    let cfr = out
+        .ciphertext_for_recipient
+        .ok_or_else(|| anyhow!("KMS returned no CiphertextForRecipient — was attestation valid?"))?
+        .into_inner();
+    Ok((blob, cfr))
 }
 
 // ─── Vsock framing helpers ──────────────────────────────────────────

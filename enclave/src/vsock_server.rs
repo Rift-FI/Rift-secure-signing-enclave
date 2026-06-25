@@ -38,30 +38,89 @@ use zeroize::Zeroize;
 
 use crate::{
     attestation, envelope,
-    protocol::{KmsDecryptRequest, KmsDecryptResponse, SignRequest, SignResponse},
+    protocol::{
+        GenerateWalletRequest, GenerateWalletResponse, KmsDecryptRequest, KmsDecryptResponse,
+        KmsGenerateDataKeyRequest, KmsGenerateDataKeyResponse, SignRequest, SignResponse,
+    },
     signing,
 };
 
+/// Serves both signing requests (existing port) and wallet-generation
+/// requests (new port). Two independent listeners share the same KMS
+/// proxy port back to the parent.
 pub async fn serve(
+    vsock_port: u32,
+    generate_wallet_port: u32,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    // Spawn the generate-wallet listener as a sibling task so a hung
+    // signing connection can't starve account creation and vice versa.
+    let gw_handle = tokio::spawn(serve_generate_wallet(
+        generate_wallet_port,
+        parent_cid,
+        parent_kms_proxy_port,
+    ));
+
+    let sign_result = serve_sign(vsock_port, parent_cid, parent_kms_proxy_port).await;
+    // Best-effort: if the sign loop exits, abort the gw loop too so
+    // the enclave-supervisor sees a single coherent failure.
+    gw_handle.abort();
+    sign_result
+}
+
+async fn serve_sign(
     vsock_port: u32,
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<()> {
     let addr = VsockAddr::new(u32::MAX, vsock_port);
     let mut listener = VsockListener::bind(addr)
-        .context("vsock bind failed — is the enclave running with vsock support?")?;
+        .context("vsock bind failed (sign) — is the enclave running with vsock support?")?;
     info!(port = vsock_port, "listening for signing requests on vsock");
 
     let mut conn_counter: u64 = 0;
     loop {
-        let (stream, peer) = listener.accept().await.context("vsock accept failed")?;
+        let (stream, peer) = listener.accept().await.context("vsock accept failed (sign)")?;
         conn_counter += 1;
         let cid = conn_counter;
-        let span = info_span!("conn", id = cid, peer_cid = peer.cid());
+        let span = info_span!("sign-conn", id = cid, peer_cid = peer.cid());
         tokio::spawn(
             async move {
                 if let Err(e) = handle_one(stream, parent_cid, parent_kms_proxy_port).await {
-                    warn!(error = ?e, "connection handler aborted");
+                    warn!(error = ?e, "sign connection handler aborted");
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+async fn serve_generate_wallet(
+    port: u32,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    let addr = VsockAddr::new(u32::MAX, port);
+    let mut listener = VsockListener::bind(addr)
+        .context("vsock bind failed (generate-wallet)")?;
+    info!(port = port, "listening for generate-wallet requests on vsock");
+
+    let mut conn_counter: u64 = 0;
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("vsock accept failed (generate-wallet)")?;
+        conn_counter += 1;
+        let cid = conn_counter;
+        let span = info_span!("gw-conn", id = cid, peer_cid = peer.cid());
+        tokio::spawn(
+            async move {
+                if let Err(e) =
+                    handle_one_generate_wallet(stream, parent_cid, parent_kms_proxy_port).await
+                {
+                    warn!(error = ?e, "generate-wallet handler aborted");
                 }
             }
             .instrument(span),
@@ -204,6 +263,139 @@ async fn process(
     Ok(sig_hex)
 }
 
+// ─── Generate-wallet pipeline ────────────────────────────────────────
+
+async fn handle_one_generate_wallet(
+    mut stream: VsockStream,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    let request = read_frame::<GenerateWalletRequest>(&mut stream).await?;
+    info!(kms_key_arn = %request.kms_key_arn, "generate-wallet request received");
+
+    let response = match process_generate_wallet(request, parent_cid, parent_kms_proxy_port).await {
+        Ok((envelope_blob, owner_address)) => GenerateWalletResponse::Ok {
+            envelope_blob,
+            owner_address,
+        },
+        Err(e) => {
+            error!(error = ?e, "generate-wallet failed");
+            GenerateWalletResponse::Err {
+                reason: format!("{e:#}"),
+            }
+        }
+    };
+    write_frame(&mut stream, &response).await?;
+    Ok(())
+}
+
+async fn process_generate_wallet(
+    req: GenerateWalletRequest,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<(String, String)> {
+    use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+
+    // 1. Ephemeral RSA-2048 for KMS-Decrypt-with-Recipient (used to
+    //    receive the freshly-generated DEK from KMS).
+    let mut rng = rand::rngs::OsRng;
+    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
+        .context("RSA-2048 keygen for KMS-recipient channel")?;
+    let rsa_pub = RsaPublicKey::from(&rsa_priv);
+    let rsa_pub_der = rsa_pub
+        .to_public_key_der()
+        .context("encode RSA pubkey")?
+        .to_vec();
+
+    // 2. NSM attestation with the RSA pubkey baked in.
+    let mut nonce = [0u8; 32];
+    rng.fill_bytes(&mut nonce);
+    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce)
+        .context("NSM attestation for generate-wallet")?;
+
+    // 3. Ask the parent KMS proxy to call kms:GenerateDataKey with the
+    //    recipient attestation. We get back BOTH the KMS-wrapped DEK
+    //    (CiphertextBlob, store it in the envelope verbatim) AND the
+    //    RSA-OAEP-wrapped plaintext DEK (CiphertextForRecipient, the
+    //    enclave unwraps to encrypt the freshly-generated EOA key).
+    let kms_req = KmsGenerateDataKeyRequest {
+        attestation_doc_b64: B64.encode(&*attestation_doc),
+        kms_key_arn: req.kms_key_arn.clone(),
+    };
+    let kms_resp = kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
+        .await
+        .context("parent KMS proxy GenerateDataKey round trip")?;
+    let (ciphertext_blob_b64, ciphertext_for_recipient_b64) = match kms_resp {
+        KmsGenerateDataKeyResponse::Ok {
+            ciphertext_blob_b64,
+            ciphertext_for_recipient_b64,
+        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
+        KmsGenerateDataKeyResponse::Err { reason } => {
+            bail!("parent KMS GenerateDataKey returned error: {reason}")
+        }
+    };
+    let cfr = B64
+        .decode(&ciphertext_for_recipient_b64)
+        .context("base64-decode CiphertextForRecipient")?;
+
+    // 4. CMS unwrap → plaintext DEK (same as the decrypt path).
+    let mut dek = cms_unwrap_data_key(&rsa_priv, &cfr)
+        .context("CMS unwrap of CiphertextForRecipient")?;
+    if dek.len() != 32 {
+        dek.zeroize();
+        bail!("DEK has unexpected length {} (want 32)", dek.len());
+    }
+
+    // 5. Generate the EOA secp256k1 keypair INSIDE the enclave.
+    let mut sk_bytes = [0u8; 32];
+    // Keep looping until k256 accepts (it rejects the all-zero and
+    // out-of-range values which are negligible-probability events).
+    let signing_key = loop {
+        rng.fill_bytes(&mut sk_bytes);
+        if let Ok(sk) = SigningKey::from_bytes((&sk_bytes).into()) {
+            break sk;
+        }
+    };
+    let pubkey = signing_key.verifying_key();
+    // 65-byte uncompressed pubkey: 0x04 || X(32) || Y(32). Ethereum
+    // address = keccak256(X || Y).last_20_bytes().
+    let uncompressed = pubkey.to_encoded_point(false);
+    let xy = &uncompressed.as_bytes()[1..];
+    let hash = Keccak256::digest(xy);
+    let addr_bytes = &hash[12..];
+    let owner_address = format!("0x{}", hex::encode(addr_bytes));
+
+    // 6. Encode the private key the same way the backend's encryptKey()
+    //    does: `0x<64 hex chars>` UTF-8 bytes. This makes the envelope
+    //    byte-for-byte compatible with backend/smart-wallet decrypt
+    //    paths and the existing /sign handler.
+    let pk_hex = format!("0x{}", hex::encode(sk_bytes));
+    sk_bytes.zeroize();
+    let plaintext_bytes = pk_hex.as_bytes();
+
+    // 7. AES-256-CBC encrypt with a fresh 16-byte IV.
+    let mut iv = [0u8; 16];
+    rng.fill_bytes(&mut iv);
+    let encryptor = Aes256CbcEnc::new(dek[..].into(), (&iv).into());
+    let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext_bytes);
+    dek.zeroize();
+
+    // 8. Assemble the envelope blob.
+    let envelope_blob = format!(
+        "enc:v1:{}:{}:{}",
+        ciphertext_blob_b64,
+        hex::encode(iv),
+        hex::encode(&ciphertext)
+    );
+
+    info!(owner_address = %owner_address, "wallet generated inside enclave");
+    Ok((envelope_blob, owner_address))
+}
+
 // ─── Vsock framing + KMS proxy round-trip ────────────────────────────
 
 async fn kms_round_trip(
@@ -215,8 +407,35 @@ async fn kms_round_trip(
     let mut stream = VsockStream::connect(addr)
         .await
         .context("vsock connect to parent KMS proxy")?;
-    write_frame(&mut stream, &request).await?;
+    let wrapped = KmsProxyRequest::Decrypt(request);
+    write_frame(&mut stream, &wrapped).await?;
     let response: KmsDecryptResponse = read_frame(&mut stream).await?;
+    Ok(response)
+}
+
+/// Same channel, different request type. The parent KMS proxy
+/// inspects an `op` discriminator on the wire and dispatches to either
+/// kms:Decrypt or kms:GenerateDataKey. Both enclave call sites use this
+/// tagged form so the parent-proxy has exactly one wire shape to parse.
+#[derive(serde::Serialize)]
+#[serde(tag = "op")]
+enum KmsProxyRequest {
+    Decrypt(KmsDecryptRequest),
+    GenerateDataKey(KmsGenerateDataKeyRequest),
+}
+
+async fn kms_generate_data_key_round_trip(
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+    request: KmsGenerateDataKeyRequest,
+) -> Result<KmsGenerateDataKeyResponse> {
+    let addr = VsockAddr::new(parent_cid, parent_kms_proxy_port);
+    let mut stream = VsockStream::connect(addr)
+        .await
+        .context("vsock connect to parent KMS proxy for GenerateDataKey")?;
+    let wrapped = KmsProxyRequest::GenerateDataKey(request);
+    write_frame(&mut stream, &wrapped).await?;
+    let response: KmsGenerateDataKeyResponse = read_frame(&mut stream).await?;
     Ok(response)
 }
 
