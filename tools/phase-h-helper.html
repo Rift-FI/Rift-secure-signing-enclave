@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rift v3 ceremony helper</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0a0b;
+      --surface: #14141a;
+      --border: #2a2a35;
+      --text: #e7e7ea;
+      --muted: #888892;
+      --accent: #7c5cff;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --err: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 32px 24px;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; }
+    h1 { font-weight: 600; letter-spacing: -0.02em; margin: 0 0 4px; }
+    h2 { font-weight: 600; letter-spacing: -0.01em; margin: 32px 0 8px; font-size: 18px; }
+    .sub { color: var(--muted); margin-top: 0; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 22px;
+      margin: 16px 0;
+    }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input[type="text"], textarea {
+      width: 100%;
+      background: #0c0c12;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+    }
+    textarea { resize: vertical; min-height: 70px; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-weight: 500;
+      cursor: pointer;
+      margin: 4px 6px 4px 0;
+    }
+    button.secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    pre {
+      background: #0c0c12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      overflow-x: auto;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .err { color: var(--err); }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .row > * { flex: 1; min-width: 0; }
+    .status { font-family: ui-monospace, monospace; font-size: 13px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Rift v3 ceremony helper</h1>
+  <p class="sub">Generates a real Google id_token and / or a real Passkey assertion bound to a specific user-op hash, then emits the curl command to send it to the parent-proxy.</p>
+
+  <div class="card">
+    <h2 style="margin-top:0">Configuration</h2>
+    <div class="row">
+      <div>
+        <label>Parent-proxy base URL</label>
+        <input id="proxyUrl" type="text" value="http://127.0.0.1:7777" />
+      </div>
+      <div>
+        <label>Bearer token (PARENT_PROXY_AUTH_TOKEN)</label>
+        <input id="proxyToken" type="text" placeholder="hex string from /etc/rift-parent-proxy.env" />
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>KMS key ARN</label>
+        <input id="kmsArn" type="text" value="arn:aws:kms:us-east-1:957814222213:key/a537dc0f-6010-4ab5-ac63-c1e5b313b640" />
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>User-op hash (32 bytes, hex, no 0x prefix)</label>
+        <input id="userOpHash" type="text" value="abababababababababababababababababababababababababababababababab" />
+      </div>
+      <div style="flex:0 0 auto">
+        <label>&nbsp;</label>
+        <button class="secondary" onclick="randomHash()">Randomise</button>
+      </div>
+    </div>
+    <p class="sub" style="margin-bottom:0">The hash is what the enclave will sign. Google will sign it into the id_token's nonce claim; the passkey assertion will sign it as challenge.</p>
+  </div>
+
+  <h2>Google OIDC ceremony</h2>
+  <div class="card">
+    <p class="sub" style="margin-top:0">Click "Sign in with Google" below. The nonce parameter is set to the user-op hash above, so the resulting id_token is bound to that exact transaction.</p>
+    <div id="g_id_signin" style="margin: 12px 0"></div>
+    <div class="status" id="googleStatus">⏳ Waiting for Google to load…</div>
+    <label>id_token (paste in or auto-filled after sign-in)</label>
+    <textarea id="idToken" rows="3" placeholder="eyJ..."></textarea>
+    <div style="margin-top:8px">
+      <button onclick="buildOidcSignCurl()">Generate /sign curl with OIDC proof</button>
+      <button class="secondary" onclick="buildOidcGenerateWalletCurl()">Generate /generate-wallet curl with OIDC enrolment</button>
+    </div>
+    <pre id="oidcCurl" style="margin-top:12px;display:none"></pre>
+  </div>
+
+  <h2>Passkey ceremony</h2>
+  <div class="card">
+    <p class="sub" style="margin-top:0">Two stages. First "Enrol passkey" creates a credential and gives you the curl for /generate-wallet. Then "Sign with passkey" produces an assertion challenged with the user-op hash and gives you the curl for /sign.</p>
+
+    <div class="row">
+      <div>
+        <label>RP ID</label>
+        <input id="rpId" type="text" value="localhost" />
+      </div>
+      <div>
+        <label>Origin (must match accepted_origins in the enclave)</label>
+        <input id="rpOrigin" type="text" value="http://localhost:3000" readonly />
+      </div>
+    </div>
+
+    <button onclick="enrolPasskey()">1. Enrol passkey</button>
+    <button onclick="signWithPasskey()" id="signBtn" disabled>2. Sign with passkey</button>
+    <div class="status" id="passkeyStatus"></div>
+
+    <label style="margin-top:14px">Enrolment result</label>
+    <pre id="passkeyEnrolOut" style="display:none"></pre>
+
+    <label style="margin-top:14px">Assertion result</label>
+    <pre id="passkeyAssertOut" style="display:none"></pre>
+
+    <div style="margin-top:8px">
+      <button onclick="buildPasskeyGenerateWalletCurl()" id="genCurlBtn" disabled>Generate /generate-wallet curl with Passkey enrolment</button>
+      <button onclick="buildPasskeySignCurl()" id="signCurlBtn" disabled>Generate /sign curl with Passkey assertion</button>
+    </div>
+    <pre id="passkeyCurl" style="margin-top:12px;display:none"></pre>
+  </div>
+
+  <div class="card" style="border-color: #2a2a35; background: #14141a">
+    <h2 style="margin-top:0">Notes</h2>
+    <ul style="margin:8px 0; padding-left:20px; color: var(--muted); font-size: 14px">
+      <li>This page is read-only locally — no network calls except to Google's GIS endpoint.</li>
+      <li>Curl commands target the parent-proxy URL above. Default <code>http://127.0.0.1:7777</code> means "paste the curl on the EC2 itself"; change it to e.g. <code>http://&lt;EC2-public-IP&gt;:7777</code> to run from your workstation.</li>
+      <li>The Bearer token never leaves this page — it just gets templated into the curl string for you.</li>
+      <li>For Passkey, this page uses RP-ID = <code>localhost</code> by default (matches the enclave's WebAuthn policy entry).</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  // ─── Google Identity Services ─────────────────────────────────────
+  // We load GIS dynamically because google.accounts.id.initialize() must
+  // be called AFTER we know the nonce (= user op hash). Calling it on
+  // every hash change re-initialises with the latest nonce.
+
+  const GOOGLE_CLIENT_ID =
+    "875173959914-fuvg3763feb4adcii6g2m2kc0g2scups.apps.googleusercontent.com";
+
+  function loadGsi() {
+    if (window.google?.accounts?.id) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://accounts.google.com/gsi/client";
+      s.async = true;
+      s.defer = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error("GIS failed to load"));
+      document.head.appendChild(s);
+    });
+  }
+
+  function initGoogle() {
+    const nonce = document.getElementById("userOpHash").value.trim();
+    google.accounts.id.initialize({
+      client_id: GOOGLE_CLIENT_ID,
+      nonce,
+      callback: (resp) => {
+        document.getElementById("idToken").value = resp.credential;
+        setStatus("googleStatus", "✓ id_token received from Google", "ok");
+      },
+    });
+    google.accounts.id.renderButton(
+      document.getElementById("g_id_signin"),
+      { theme: "outline", size: "large", text: "signin_with" }
+    );
+    setStatus("googleStatus", "Ready — click the button to sign in.", "");
+  }
+
+  loadGsi().then(initGoogle).catch((e) => {
+    setStatus("googleStatus", "✗ " + e.message, "err");
+  });
+
+  // Re-initialise GIS every time the hash changes so the new nonce
+  // is baked into the next sign-in.
+  document.getElementById("userOpHash").addEventListener("input", () => {
+    if (window.google?.accounts?.id) {
+      document.getElementById("g_id_signin").innerHTML = "";
+      initGoogle();
+    }
+  });
+
+  function setStatus(id, msg, cls) {
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.className = "status " + (cls || "");
+  }
+
+  function randomHash() {
+    const b = new Uint8Array(32);
+    crypto.getRandomValues(b);
+    const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    document.getElementById("userOpHash").value = h;
+    document.getElementById("userOpHash").dispatchEvent(new Event("input"));
+  }
+
+  // ─── Curl emitters ────────────────────────────────────────────────
+  function curlSign(bodyObj) {
+    const url = document.getElementById("proxyUrl").value.trim() + "/sign";
+    const token = document.getElementById("proxyToken").value.trim();
+    const auth = token ? ` \\\n  -H "authorization: Bearer ${token}"` : "";
+    const body = JSON.stringify(bodyObj, null, 2);
+    return `curl -s -X POST ${url} \\\n  -H 'content-type: application/json'${auth} \\\n  -d '${body.replace(/'/g, "'\\''")}'`;
+  }
+
+  function curlGenerate(bodyObj) {
+    const url = document.getElementById("proxyUrl").value.trim() + "/generate-wallet";
+    const token = document.getElementById("proxyToken").value.trim();
+    const auth = token ? ` \\\n  -H "authorization: Bearer ${token}"` : "";
+    const body = JSON.stringify(bodyObj, null, 2);
+    return `curl -s -X POST ${url} \\\n  -H 'content-type: application/json'${auth} \\\n  -d '${body.replace(/'/g, "'\\''")}'`;
+  }
+
+  // ─── OIDC curl generators ─────────────────────────────────────────
+  function buildOidcGenerateWalletCurl() {
+    const tok = document.getElementById("idToken").value.trim();
+    let iss = "https://accounts.google.com", sub = "";
+    if (tok) {
+      try {
+        const payload = JSON.parse(atob(tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+        iss = payload.iss || iss;
+        sub = payload.sub || "";
+      } catch {}
+    }
+    if (!sub) {
+      alert("Sign in with Google first so we can read the sub claim from the id_token.");
+      return;
+    }
+    const out = curlGenerate({
+      kms_key_arn: document.getElementById("kmsArn").value.trim(),
+      enrolled_methods: [{ kind: "oidc", iss, sub }],
+    });
+    showCurl("oidcCurl", out, `# This enrols (iss=${iss}, sub=${sub}) on a new v3 wallet.\n# After running, the response gives you a fresh v3 envelope_blob you can use\n# below in the /sign curl.\n\n` + out);
+  }
+
+  function buildOidcSignCurl() {
+    const tok = document.getElementById("idToken").value.trim();
+    if (!tok) { alert("Get an id_token first."); return; }
+    const hash = document.getElementById("userOpHash").value.trim();
+    const out = curlSign({
+      user_op_hash_hex: hash,
+      v3_envelope_blob: "<<PASTE_V3_ENVELOPE_BLOB_HERE>>",
+      auth_proof: { kind: "oidc", id_token: tok },
+      kms_key_arn: document.getElementById("kmsArn").value.trim(),
+    });
+    showCurl(
+      "oidcCurl",
+      `# Replace <<PASTE_V3_ENVELOPE_BLOB_HERE>> with the envelope_blob you got\n# from the /generate-wallet curl above (the OIDC-enrolled wallet).\n# The id_token below has nonce=${hash} baked in by Google.\n\n` + out
+    );
+  }
+
+  function showCurl(id, text) {
+    const el = document.getElementById(id);
+    el.style.display = "block";
+    el.textContent = text;
+  }
+
+  // ─── Passkey ──────────────────────────────────────────────────────
+  let lastCredential = null; // stores enrol result + extracted COSE bits
+
+  async function enrolPasskey() {
+    try {
+      setStatus("passkeyStatus", "Enrolling…", "");
+      const rpId = document.getElementById("rpId").value.trim();
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const cred = await navigator.credentials.create({
+        publicKey: {
+          challenge,
+          rp: { id: rpId, name: "Rift Local Test" },
+          user: {
+            id: crypto.getRandomValues(new Uint8Array(16)),
+            name: "test-user@" + rpId,
+            displayName: "Rift Test User",
+          },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }], // ES256
+          authenticatorSelection: {
+            userVerification: "required",
+            residentKey: "preferred",
+          },
+          timeout: 60000,
+          attestation: "none",
+        },
+      });
+
+      // getPublicKey() returns SPKI DER. For P-256, the last 65 bytes
+      // are: 0x04 || X(32) || Y(32). We slice those out and pack as a
+      // COSE_Key map for the enclave.
+      const spki = new Uint8Array(cred.response.getPublicKey());
+      if (spki[spki.length - 65] !== 0x04) {
+        throw new Error("public key isn't an uncompressed P-256 point — unexpected SPKI layout");
+      }
+      const x = spki.slice(spki.length - 64, spki.length - 32);
+      const y = spki.slice(spki.length - 32);
+      const coseCbor = encodeCoseEc2P256(x, y);
+
+      lastCredential = {
+        credentialId: new Uint8Array(cred.rawId),
+        coseCbor,
+      };
+
+      const credIdB64 = btoa(String.fromCharCode(...lastCredential.credentialId));
+      const coseB64 = btoa(String.fromCharCode(...coseCbor));
+      const out =
+        `credentialId (b64): ${credIdB64}\n` +
+        `credentialId (hex): ${Array.from(lastCredential.credentialId, b => b.toString(16).padStart(2, "0")).join("")}\n\n` +
+        `COSE_Key (b64):     ${coseB64}\n` +
+        `COSE_Key (hex):     ${Array.from(coseCbor, b => b.toString(16).padStart(2, "0")).join("")}`;
+      showCurl("passkeyEnrolOut", out);
+      setStatus("passkeyStatus", "✓ Passkey enrolled. Click \"Sign with passkey\" next.", "ok");
+      document.getElementById("signBtn").disabled = false;
+      document.getElementById("genCurlBtn").disabled = false;
+    } catch (e) {
+      setStatus("passkeyStatus", "✗ " + (e?.message || e), "err");
+    }
+  }
+
+  async function signWithPasskey() {
+    try {
+      if (!lastCredential) throw new Error("enrol first");
+      setStatus("passkeyStatus", "Producing assertion…", "");
+      const rpId = document.getElementById("rpId").value.trim();
+      const hashHex = document.getElementById("userOpHash").value.trim();
+      const challenge = hexToBytes(hashHex);
+      if (challenge.length !== 32) throw new Error("user-op hash must be 32 bytes (64 hex chars)");
+
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge,
+          rpId,
+          allowCredentials: [{ type: "public-key", id: lastCredential.credentialId }],
+          userVerification: "required",
+          timeout: 60000,
+        },
+      });
+
+      const clientDataJSON = new Uint8Array(assertion.response.clientDataJSON);
+      const authenticatorData = new Uint8Array(assertion.response.authenticatorData);
+      const signature = new Uint8Array(assertion.response.signature);
+
+      lastAssertion = {
+        credentialId: new Uint8Array(assertion.rawId),
+        clientDataJSON,
+        authenticatorData,
+        signature,
+      };
+
+      const out =
+        `clientDataJSON (decoded):\n${new TextDecoder().decode(clientDataJSON)}\n\n` +
+        `clientDataJSON (b64):    ${b64u8(clientDataJSON)}\n` +
+        `authenticatorData (b64): ${b64u8(authenticatorData)}\n` +
+        `signature (b64):         ${b64u8(signature)}`;
+      showCurl("passkeyAssertOut", out);
+      setStatus("passkeyStatus", "✓ Assertion produced. Click \"Generate /sign curl\" to build the command.", "ok");
+      document.getElementById("signCurlBtn").disabled = false;
+    } catch (e) {
+      setStatus("passkeyStatus", "✗ " + (e?.message || e), "err");
+    }
+  }
+
+  let lastAssertion = null;
+
+  function buildPasskeyGenerateWalletCurl() {
+    if (!lastCredential) { alert("Enrol first."); return; }
+    const out = curlGenerate({
+      kms_key_arn: document.getElementById("kmsArn").value.trim(),
+      enrolled_methods: [
+        {
+          kind: "passkey",
+          cred_id_b64: b64u8(lastCredential.credentialId),
+          cose_pubkey_b64: b64u8(lastCredential.coseCbor),
+        },
+      ],
+    });
+    showCurl(
+      "passkeyCurl",
+      `# This enrols the passkey on a fresh v3 wallet.\n# After running, the response gives you a v3 envelope_blob to use below.\n\n` + out
+    );
+  }
+
+  function buildPasskeySignCurl() {
+    if (!lastAssertion) { alert("Sign first."); return; }
+    const hash = document.getElementById("userOpHash").value.trim();
+    const out = curlSign({
+      user_op_hash_hex: hash,
+      v3_envelope_blob: "<<PASTE_V3_ENVELOPE_BLOB_HERE>>",
+      auth_proof: {
+        kind: "passkey",
+        cred_id_b64: b64u8(lastAssertion.credentialId),
+        client_data_json_b64: b64u8(lastAssertion.clientDataJSON),
+        authenticator_data_b64: b64u8(lastAssertion.authenticatorData),
+        signature_b64: b64u8(lastAssertion.signature),
+      },
+      kms_key_arn: document.getElementById("kmsArn").value.trim(),
+    });
+    showCurl(
+      "passkeyCurl",
+      `# Replace <<PASTE_V3_ENVELOPE_BLOB_HERE>> with the envelope_blob from\n# the passkey /generate-wallet curl above.\n# The assertion is challenge-bound to hash=${hash}.\n\n` + out
+    );
+  }
+
+  // ─── Tiny CBOR + helpers ──────────────────────────────────────────
+  // COSE_Key for EC2 P-256 ES256 is a small CBOR map. Encoding it
+  // manually avoids pulling in a CBOR library for ~30 bytes of output.
+  function encodeCoseEc2P256(x, y) {
+    // Map with 5 entries:
+    //   1 (kty)  → 2 (EC2)
+    //   3 (alg)  → -7 (ES256)
+    //   -1 (crv) → 1 (P-256)
+    //   -2 (x)   → 32-byte string
+    //   -3 (y)   → 32-byte string
+    const out = [0xa5]; // map(5)
+    out.push(0x01); out.push(0x02);                  // 1 → 2
+    out.push(0x03); out.push(0x26);                  // 3 → -7 (encoded as 0x26 = negative-int header)
+    out.push(0x20); out.push(0x01);                  // -1 → 1
+    out.push(0x21); out.push(0x58, 0x20); out.push(...x); // -2 → bytes(32) X
+    out.push(0x22); out.push(0x58, 0x20); out.push(...y); // -3 → bytes(32) Y
+    return new Uint8Array(out);
+  }
+
+  function b64u8(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+  }
+
+  function hexToBytes(hex) {
+    const clean = hex.replace(/^0x/i, "").trim();
+    if (clean.length % 2) throw new Error("hex string has odd length");
+    const out = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = parseInt(clean.substr(i * 2, 2), 16);
+    }
+    return out;
+  }
+</script>
+</body>
+</html>
