@@ -37,35 +37,44 @@ use tracing::{error, info, info_span, warn, Instrument};
 use zeroize::Zeroize;
 
 use crate::{
-    attestation, envelope,
+    attestation, envelope, envelope_v3, oidc_verification, password_derivation, pinned_jwks,
     protocol::{
-        GenerateWalletRequest, GenerateWalletResponse, KmsDecryptRequest, KmsDecryptResponse,
-        KmsGenerateDataKeyRequest, KmsGenerateDataKeyResponse, SignRequest, SignResponse,
+        AuthProof, EnrolledMethod, GenerateWalletRequest, GenerateWalletResponse,
+        KmsDecryptRequest, KmsDecryptResponse, KmsGenerateDataKeyRequest,
+        KmsGenerateDataKeyResponse, MigrateEnvelopeRequest, MigrateEnvelopeResponse,
+        SignRequest, SignResponse,
     },
-    signing,
+    signing, webauthn_verification,
 };
 
-/// Serves both signing requests (existing port) and wallet-generation
-/// requests (new port). Two independent listeners share the same KMS
-/// proxy port back to the parent.
+/// Serves three concurrent vsock listeners — sign (5005),
+/// generate-wallet (5007), and migrate-envelope (5008). Each is an
+/// independent tokio task so a hung listener of one kind cannot
+/// starve the others.
 pub async fn serve(
     vsock_port: u32,
     generate_wallet_port: u32,
+    migrate_port: u32,
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<()> {
-    // Spawn the generate-wallet listener as a sibling task so a hung
-    // signing connection can't starve account creation and vice versa.
     let gw_handle = tokio::spawn(serve_generate_wallet(
         generate_wallet_port,
         parent_cid,
         parent_kms_proxy_port,
     ));
+    let mig_handle = tokio::spawn(serve_migrate(
+        migrate_port,
+        parent_cid,
+        parent_kms_proxy_port,
+    ));
 
     let sign_result = serve_sign(vsock_port, parent_cid, parent_kms_proxy_port).await;
-    // Best-effort: if the sign loop exits, abort the gw loop too so
-    // the enclave-supervisor sees a single coherent failure.
+    // Best-effort: if the sign loop exits, abort the others too so the
+    // enclave-supervisor sees a single coherent failure rather than a
+    // partially-up enclave.
     gw_handle.abort();
+    mig_handle.abort();
     sign_result
 }
 
@@ -158,6 +167,13 @@ async fn process(
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<String> {
+    // v3 path takes priority: if the caller set v3_envelope_blob, we
+    // parse it inline and ignore the v1/v2 fields entirely. This is
+    // the device-bound, no-password path used by Passkey / OIDC users.
+    if let Some(blob) = req.v3_envelope_blob.as_ref() {
+        return process_v3(req.user_op_hash_hex.clone(), blob.clone(), req.auth_proof.clone(), req.kms_key_arn.clone(), parent_cid, parent_kms_proxy_port).await;
+    }
+
     // ─── 1. Ephemeral RSA-2048 keypair ───────────────────────────────
     // Generated inside the enclave; private key never leaves this
     // function's stack; the public key goes into the attestation doc.
@@ -218,30 +234,92 @@ async fn process(
         bail!("unwrapped DEK has unexpected length {} (want 32)", dek.len());
     }
 
-    // ─── 5. AES-256-CBC decrypt envelope payload ────────────────────
-    let iv = hex::decode(req.iv_hex.trim_start_matches("0x"))
-        .context("hex-decode envelope IV")?;
-    let ciphertext = hex::decode(req.ciphertext_hex.trim_start_matches("0x"))
-        .context("hex-decode envelope ciphertext")?;
-    let plaintext = envelope::decrypt(&dek, &iv, &ciphertext)?;
-    // Wipe the DEK now — it's not needed past this point.
-    dek.zeroize();
+    // ─── 5. Decrypt envelope payload (v1 CBC vs v2 GCM) ─────────────
+    // v2 path: password + salt + nonce + tag are all set. We derive
+    // K_user from the password and combine with the KMS DEK, then
+    // authenticate-decrypt with AES-GCM. Wrong password fails the GCM
+    // tag check and we return "invalid credentials" without leaking
+    // which factor failed.
+    //
+    // v1 path: legacy AES-CBC with the raw KMS DEK only. No password
+    // required. Plaintext is the hex string of the private key.
+    let pk_bytes: Vec<u8> = if let (Some(password), Some(salt_b64), Some(nonce_hex), Some(tag_hex)) = (
+        req.password.as_ref(),
+        req.salt_b64.as_ref(),
+        req.nonce_hex.as_ref(),
+        req.tag_hex.as_ref(),
+    ) {
+        // v2: AES-GCM, password-bound. Plaintext is the raw 32-byte key.
+        let salt = B64.decode(salt_b64).context("decode salt_b64")?;
+        if salt.len() != password_derivation::SALT_LEN {
+            dek.zeroize();
+            bail!(
+                "salt must be {} bytes, got {}",
+                password_derivation::SALT_LEN,
+                salt.len()
+            );
+        }
+        let k_user = password_derivation::derive_user_key(password.as_bytes(), &salt)?;
+        let mut dek_arr = [0u8; 32];
+        dek_arr.copy_from_slice(&dek[..]);
+        let k_aes = password_derivation::combine_keys(&dek_arr, &k_user);
+        dek.zeroize();
+        // safe to drop dek_arr; k_aes is Zeroizing<[u8;32]>.
 
-    // ─── 6. Parse the plaintext into a 32-byte secp256k1 key ────────
-    // The backend's keyEncryption.ts stores the key as a hex string,
-    // optionally with 0x prefix. plaintext here is that string's bytes
-    // (UTF-8).
-    let pk_hex = std::str::from_utf8(&plaintext)
-        .map_err(|_| anyhow!("decrypted plaintext is not valid UTF-8"))?;
-    let pk_hex_clean = pk_hex.trim().trim_start_matches("0x");
-    let pk_bytes =
-        hex::decode(pk_hex_clean).context("hex-decode EOA private key from envelope plaintext")?;
-    if pk_bytes.len() != 32 {
-        bail!(
-            "EOA private key has unexpected length {} (want 32)",
-            pk_bytes.len()
-        );
-    }
+        let nonce_bytes =
+            hex::decode(nonce_hex.trim_start_matches("0x")).context("hex-decode nonce")?;
+        if nonce_bytes.len() != password_derivation::GCM_NONCE_LEN {
+            bail!(
+                "nonce must be {} bytes, got {}",
+                password_derivation::GCM_NONCE_LEN,
+                nonce_bytes.len()
+            );
+        }
+        let mut nonce_arr = [0u8; 12];
+        nonce_arr.copy_from_slice(&nonce_bytes);
+
+        let mut ct = hex::decode(req.ciphertext_hex.trim_start_matches("0x"))
+            .context("hex-decode v2 ciphertext")?;
+        let tag = hex::decode(tag_hex.trim_start_matches("0x")).context("hex-decode tag")?;
+        if tag.len() != password_derivation::GCM_TAG_LEN {
+            bail!(
+                "tag must be {} bytes, got {}",
+                password_derivation::GCM_TAG_LEN,
+                tag.len()
+            );
+        }
+        ct.extend_from_slice(&tag);
+
+        let pt = password_derivation::aead_decrypt(&k_aes, &nonce_arr, &ct)?;
+        if pt.len() != 32 {
+            bail!(
+                "v2 plaintext has unexpected length {} (want 32 raw bytes)",
+                pt.len()
+            );
+        }
+        pt.to_vec()
+    } else {
+        // v1: AES-CBC, KMS-only. Plaintext is hex-encoded.
+        let iv = hex::decode(req.iv_hex.trim_start_matches("0x"))
+            .context("hex-decode v1 envelope IV")?;
+        let ciphertext = hex::decode(req.ciphertext_hex.trim_start_matches("0x"))
+            .context("hex-decode v1 envelope ciphertext")?;
+        let plaintext = envelope::decrypt(&dek, &iv, &ciphertext)?;
+        dek.zeroize();
+
+        let pk_hex = std::str::from_utf8(&plaintext)
+            .map_err(|_| anyhow!("decrypted plaintext is not valid UTF-8"))?;
+        let pk_hex_clean = pk_hex.trim().trim_start_matches("0x");
+        let pk_bytes = hex::decode(pk_hex_clean)
+            .context("hex-decode EOA private key from v1 envelope plaintext")?;
+        if pk_bytes.len() != 32 {
+            bail!(
+                "EOA private key has unexpected length {} (want 32)",
+                pk_bytes.len()
+            );
+        }
+        pk_bytes
+    };
 
     // ─── 7. Sign ────────────────────────────────────────────────────
     let user_op_hash_clean = req.user_op_hash_hex.trim_start_matches("0x");
@@ -261,6 +339,199 @@ async fn process(
     let sig_hex = format!("0x{}", hex::encode(&*sig));
     info!("signing complete, returning signature");
     Ok(sig_hex)
+}
+
+// ─── v3 sign pipeline ───────────────────────────────────────────────
+//
+// Same KMS Decrypt-with-Recipient round trip as v1/v2, but the
+// decrypted payload is the v3 CBOR record (EOA priv + auth_methods).
+// Before signing we verify the caller-supplied auth_proof against the
+// stored methods — without this the engineer-with-deploy-access
+// threat model wins.
+
+async fn process_v3(
+    user_op_hash_hex: String,
+    v3_blob: String,
+    auth_proof: Option<AuthProof>,
+    kms_key_arn: String,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<String> {
+    let proof = auth_proof
+        .ok_or_else(|| anyhow!("v3 sign request missing auth_proof"))?;
+
+    // Parse the envelope FIRST so a malformed blob fails fast without
+    // burning a KMS call.
+    let env = envelope_v3::EnvelopeV3::parse(&v3_blob)
+        .context("parse v3 envelope blob")?;
+    let wrapped_dek_b64 = B64.encode(&env.wrapped_dek);
+
+    // KMS Decrypt-with-Recipient round trip identical to v1/v2.
+    let (mut dek, attestation_ts) =
+        kms_decrypt_dek(parent_cid, parent_kms_proxy_port, &wrapped_dek_b64, &kms_key_arn).await?;
+    if dek.len() != 32 {
+        dek.zeroize();
+        bail!("unwrapped DEK has unexpected length {} (want 32)", dek.len());
+    }
+    let mut dek_arr = [0u8; 32];
+    dek_arr.copy_from_slice(&dek[..]);
+    dek.zeroize();
+
+    // Open the v3 envelope. On any AES-GCM tag failure we return the
+    // exact same "invalid credentials" string as v2 — no leak of
+    // which factor (KMS unwrap vs payload decrypt) actually failed.
+    let (priv_key, methods) = envelope_v3::open(&env, &dek_arr)?;
+    dek_arr.zeroize();
+
+    // Parse the user op hash up front — we need 32 raw bytes for the
+    // WebAuthn challenge comparison AND for the secp256k1 sign call.
+    let user_op_hash_clean = user_op_hash_hex.trim_start_matches("0x");
+    let user_op_hash_bytes =
+        hex::decode(user_op_hash_clean).context("hex-decode user op hash")?;
+    if user_op_hash_bytes.len() != 32 {
+        bail!(
+            "user op hash has unexpected length {} (want 32)",
+            user_op_hash_bytes.len()
+        );
+    }
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&user_op_hash_bytes);
+
+    // Verify the auth_proof against one of the enrolled methods. We
+    // pick the matching method by `kind`; if none verifies we refuse.
+    verify_auth_proof(&proof, &methods, &hash_arr, attestation_ts)
+        .context("v3 auth_proof verification failed")?;
+
+    // Sign.
+    let sig = signing::sign_user_op_hash(&priv_key, &hash_arr)?;
+    let sig_hex = format!("0x{}", hex::encode(&*sig));
+    info!("v3 signing complete, returning signature");
+    Ok(sig_hex)
+}
+
+/// Run the auth_proof against the stored auth_methods. The proof
+/// matches if EITHER an OIDC token verifies against a stored
+/// `Oidc { iss, sub }` row OR a WebAuthn assertion verifies against a
+/// stored `Passkey { cred_id, cose }` row whose cred_id matches.
+fn verify_auth_proof(
+    proof: &AuthProof,
+    methods: &[envelope_v3::AuthMethod],
+    user_op_hash: &[u8; 32],
+    now_unix_secs: i64,
+) -> Result<()> {
+    match proof {
+        AuthProof::Oidc { id_token } => {
+            let user_op_hash_hex = hex::encode(user_op_hash);
+            let jwks = pinned_jwks::current_jwks();
+            let policy = oidc_verification::OidcTrustPolicy::default_prod();
+            let verified = oidc_verification::verify_id_token(
+                id_token,
+                &user_op_hash_hex,
+                now_unix_secs,
+                &jwks,
+                &policy,
+            )?;
+            // Must match an enrolled OIDC method by (iss, sub).
+            let matched = methods.iter().any(|m| match m {
+                envelope_v3::AuthMethod::Oidc { iss, sub } => {
+                    iss == &verified.iss && sub == &verified.sub
+                }
+                _ => false,
+            });
+            if !matched {
+                bail!("OIDC token verified but no enrolled method matches (iss, sub)");
+            }
+            Ok(())
+        }
+        AuthProof::Passkey {
+            cred_id_b64,
+            client_data_json_b64,
+            authenticator_data_b64,
+            signature_b64,
+        } => {
+            let cred_id = B64
+                .decode(cred_id_b64)
+                .context("base64-decode passkey cred_id")?;
+            let client_data_json = B64
+                .decode(client_data_json_b64)
+                .context("base64-decode clientDataJSON")?;
+            let authenticator_data = B64
+                .decode(authenticator_data_b64)
+                .context("base64-decode authenticatorData")?;
+            let signature = B64
+                .decode(signature_b64)
+                .context("base64-decode signature")?;
+
+            // Look up the stored COSE pubkey by cred_id.
+            let cose_bytes = methods
+                .iter()
+                .find_map(|m| match m {
+                    envelope_v3::AuthMethod::Passkey { cred_id: stored, cose } if stored == &cred_id => {
+                        Some(cose.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("no enrolled passkey matches the assertion's cred_id"))?;
+
+            let cose = webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose_bytes)?;
+            let policy = webauthn_verification::WebAuthnPolicy::default_prod();
+            webauthn_verification::verify_assertion(
+                &cose,
+                &client_data_json,
+                &authenticator_data,
+                &signature,
+                user_op_hash,
+                &policy,
+            )
+        }
+    }
+}
+
+/// Helper: run the KMS Decrypt-with-Recipient round trip end-to-end
+/// and return the plaintext DEK plus the attestation timestamp (used
+/// as the trusted "now" for OIDC exp/iat checks).
+///
+/// Hoisted out so v1/v2/v3 sign paths can share it without recopying
+/// the attestation + CMS unwrap dance.
+async fn kms_decrypt_dek(
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+    wrapped_dek_b64: &str,
+    kms_key_arn: &str,
+) -> Result<(Vec<u8>, i64)> {
+    let mut rng = rand::rngs::OsRng;
+    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
+        .context("RSA-2048 key generation failed inside the enclave")?;
+    let rsa_pub = RsaPublicKey::from(&rsa_priv);
+    let rsa_pub_der = rsa_pub
+        .to_public_key_der()
+        .context("encode RSA public key as DER")?
+        .to_vec();
+
+    let mut nonce = [0u8; 32];
+    rng.fill_bytes(&mut nonce);
+    let (attestation_doc, attestation_ts) =
+        attestation::attest_with_timestamp(&rsa_pub_der, &nonce)
+            .context("NSM attestation document generation")?;
+
+    let kms_req = KmsDecryptRequest {
+        attestation_doc_b64: B64.encode(&*attestation_doc),
+        wrapped_dek_b64: wrapped_dek_b64.to_string(),
+        kms_key_arn: kms_key_arn.to_string(),
+    };
+    let kms_resp = kms_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
+        .await
+        .context("parent KMS proxy round trip")?;
+    let ciphertext_for_recipient_b64 = match kms_resp {
+        KmsDecryptResponse::Ok { ciphertext_for_recipient_b64 } => ciphertext_for_recipient_b64,
+        KmsDecryptResponse::Err { reason } => bail!("parent KMS proxy returned error: {reason}"),
+    };
+    let ciphertext_for_recipient = B64
+        .decode(&ciphertext_for_recipient_b64)
+        .context("base64-decode CiphertextForRecipient")?;
+    let dek = cms_unwrap_data_key(&rsa_priv, &ciphertext_for_recipient)
+        .context("CMS unwrap of KMS CiphertextForRecipient")?;
+    Ok((dek, attestation_ts))
 }
 
 // ─── Generate-wallet pipeline ────────────────────────────────────────
@@ -369,31 +640,426 @@ async fn process_generate_wallet(
     let addr_bytes = &hash[12..];
     let owner_address = format!("0x{}", hex::encode(addr_bytes));
 
-    // 6. Encode the private key the same way the backend's encryptKey()
-    //    does: `0x<64 hex chars>` UTF-8 bytes. This makes the envelope
-    //    byte-for-byte compatible with backend/smart-wallet decrypt
-    //    paths and the existing /sign handler.
-    let pk_hex = format!("0x{}", hex::encode(sk_bytes));
-    sk_bytes.zeroize();
-    let plaintext_bytes = pk_hex.as_bytes();
+    // 6+7+8. Three paths, picked in priority order:
+    //   v3 (enrolled_methods non-empty): device-bound, no password.
+    //       The EOA priv + auth_methods are AES-GCM-sealed under the
+    //       DEK. Every sign requires a fresh OIDC or Passkey proof.
+    //   v2 (password present): password-bound XOR-share scheme.
+    //   v1 (neither): KMS-only legacy.
+    let envelope_blob = if !req.enrolled_methods.is_empty() {
+        // v3: seal (priv_key + auth_methods) under AES-GCM with the
+        // KMS-released DEK. No password share; consent at sign-time
+        // is enforced via the auth_proof against the enrolled list.
+        let mut auth_methods: Vec<envelope_v3::AuthMethod> = Vec::with_capacity(req.enrolled_methods.len());
+        for m in &req.enrolled_methods {
+            match m {
+                EnrolledMethod::Oidc { iss, sub } => {
+                    auth_methods.push(envelope_v3::AuthMethod::Oidc {
+                        iss: iss.clone(),
+                        sub: sub.clone(),
+                    });
+                }
+                EnrolledMethod::Passkey { cred_id_b64, cose_pubkey_b64 } => {
+                    let cred_id = B64
+                        .decode(cred_id_b64)
+                        .context("base64-decode enrolled cred_id")?;
+                    let cose = B64
+                        .decode(cose_pubkey_b64)
+                        .context("base64-decode enrolled cose")?;
+                    // Validate the COSE bytes parse — refuse a bad
+                    // enrolment at the gate rather than at first sign.
+                    webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose)
+                        .context("validate enrolled passkey COSE_Key")?;
+                    auth_methods.push(envelope_v3::AuthMethod::Passkey { cred_id, cose });
+                }
+            }
+        }
 
-    // 7. AES-256-CBC encrypt with a fresh 16-byte IV.
-    let mut iv = [0u8; 16];
-    rng.fill_bytes(&mut iv);
-    let encryptor = Aes256CbcEnc::new(dek[..].into(), (&iv).into());
-    let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext_bytes);
-    dek.zeroize();
+        let mut dek_arr = [0u8; 32];
+        dek_arr.copy_from_slice(&dek[..]);
+        dek.zeroize();
+        let mut nonce_bytes = [0u8; password_derivation::GCM_NONCE_LEN];
+        rng.fill_bytes(&mut nonce_bytes);
 
-    // 8. Assemble the envelope blob.
-    let envelope_blob = format!(
-        "enc:v1:{}:{}:{}",
-        ciphertext_blob_b64,
-        hex::encode(iv),
-        hex::encode(&ciphertext)
-    );
+        let blob = envelope_v3::seal(
+            &sk_bytes,
+            auth_methods,
+            &dek_arr,
+            &nonce_bytes,
+            &ciphertext_blob_b64,
+        )?;
+        sk_bytes.zeroize();
+        dek_arr.zeroize();
+        blob
+    } else if let Some(password) = req.password.as_ref() {
+        // v2: AES-256-GCM with K_aes = DEK XOR HKDF(password, salt).
+        // Plaintext is the raw 32-byte private key (no hex encoding).
+        let mut salt = [0u8; password_derivation::SALT_LEN];
+        rng.fill_bytes(&mut salt);
+        let k_user = password_derivation::derive_user_key(password.as_bytes(), &salt)?;
+        let mut dek_arr = [0u8; 32];
+        dek_arr.copy_from_slice(&dek[..]);
+        let k_aes = password_derivation::combine_keys(&dek_arr, &k_user);
+        dek.zeroize();
+
+        let mut nonce_bytes = [0u8; password_derivation::GCM_NONCE_LEN];
+        rng.fill_bytes(&mut nonce_bytes);
+
+        let ct_with_tag = password_derivation::aead_encrypt(&k_aes, &nonce_bytes, &sk_bytes)?;
+        sk_bytes.zeroize();
+
+        // Split ct from tag for the wire format.
+        let tag_start = ct_with_tag.len() - password_derivation::GCM_TAG_LEN;
+        let (ct, tag) = ct_with_tag.split_at(tag_start);
+
+        format!(
+            "enc:v2:{}:{}:{}:{}:{}",
+            ciphertext_blob_b64,
+            B64.encode(salt),
+            hex::encode(nonce_bytes),
+            hex::encode(ct),
+            hex::encode(tag)
+        )
+    } else {
+        // v1: AES-256-CBC, KMS-only, plaintext is hex-encoded.
+        let pk_hex = format!("0x{}", hex::encode(sk_bytes));
+        sk_bytes.zeroize();
+        let plaintext_bytes = pk_hex.as_bytes();
+
+        let mut iv = [0u8; 16];
+        rng.fill_bytes(&mut iv);
+        let encryptor = Aes256CbcEnc::new(dek[..].into(), (&iv).into());
+        let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext_bytes);
+        dek.zeroize();
+
+        format!(
+            "enc:v1:{}:{}:{}",
+            ciphertext_blob_b64,
+            hex::encode(iv),
+            hex::encode(&ciphertext)
+        )
+    };
 
     info!(owner_address = %owner_address, "wallet generated inside enclave");
     Ok((envelope_blob, owner_address))
+}
+
+// ─── Migrate-envelope pipeline ───────────────────────────────────────
+//
+// Upgrade an existing v1 or v2 envelope to v3 without ever exposing
+// the EOA private key outside the enclave. Pipeline:
+//
+//   1. KMS-Decrypt the OLD wrapped DEK (Recipient-attested).
+//   2. Open the OLD envelope payload — CBC for v1, GCM for v2 (and the
+//      v2 path requires the caller-supplied old_password).
+//   3. Recover the raw secp256k1 private key + derive the owner addr.
+//   4. KMS-GenerateDataKey to mint a FRESH DEK (so the new v3 envelope
+//      has no shared DEK with the old one — clean cryptographic break).
+//   5. Seal (priv_key + enrolled_methods) as a new v3 envelope.
+//   6. Return the new blob + owner_address.
+//
+// The OLD envelope row stays untouched on disk — backend swaps in the
+// new blob in a single DB write so a failure mid-flight is recoverable.
+
+async fn serve_migrate(
+    port: u32,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    let addr = VsockAddr::new(u32::MAX, port);
+    let mut listener = VsockListener::bind(addr)
+        .context("vsock bind failed (migrate)")?;
+    info!(port = port, "listening for migrate-envelope requests on vsock");
+
+    let mut conn_counter: u64 = 0;
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("vsock accept failed (migrate)")?;
+        conn_counter += 1;
+        let cid = conn_counter;
+        let span = info_span!("mig-conn", id = cid, peer_cid = peer.cid());
+        tokio::spawn(
+            async move {
+                if let Err(e) =
+                    handle_one_migrate(stream, parent_cid, parent_kms_proxy_port).await
+                {
+                    warn!(error = ?e, "migrate handler aborted");
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+async fn handle_one_migrate(
+    mut stream: VsockStream,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    let request = read_frame::<MigrateEnvelopeRequest>(&mut stream).await?;
+    info!(
+        kms_key_arn = %request.kms_key_arn,
+        method_count = request.enrolled_methods.len(),
+        "migrate-envelope request received"
+    );
+
+    let response = match process_migrate(request, parent_cid, parent_kms_proxy_port).await {
+        Ok((envelope_blob, owner_address)) => MigrateEnvelopeResponse::Ok {
+            envelope_blob,
+            owner_address,
+        },
+        Err(e) => {
+            error!(error = ?e, "migrate-envelope failed");
+            MigrateEnvelopeResponse::Err {
+                reason: format!("{e:#}"),
+            }
+        }
+    };
+    write_frame(&mut stream, &response).await?;
+    Ok(())
+}
+
+async fn process_migrate(
+    req: MigrateEnvelopeRequest,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<(String, String)> {
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+
+    if req.enrolled_methods.is_empty() {
+        bail!("migrate requires at least one enrolled method on the new v3 envelope");
+    }
+
+    // ─── 1. Parse old envelope ───────────────────────────────────────
+    // We need the wrapped_dek out of the old blob so we can KMS-decrypt
+    // it. The wrapped_dek for v1 and v2 lives at the same position
+    // (first field after the prefix); the rest of the layout differs.
+    let (old_wrapped_dek_b64, old_kind) = parse_old_envelope_prefix(&req.old_envelope_blob)?;
+
+    // ─── 2. KMS-Decrypt the OLD DEK ──────────────────────────────────
+    let (mut old_dek, _attestation_ts) = kms_decrypt_dek(
+        parent_cid,
+        parent_kms_proxy_port,
+        &old_wrapped_dek_b64,
+        &req.kms_key_arn,
+    )
+    .await?;
+    if old_dek.len() != 32 {
+        old_dek.zeroize();
+        bail!("old wrapped DEK has unexpected length {} (want 32)", old_dek.len());
+    }
+
+    // ─── 3. Open the old envelope → raw priv key ─────────────────────
+    let mut priv_key: Vec<u8> = match old_kind {
+        OldEnvelopeKind::V1 => {
+            // v1 layout: enc:v1:<wrapped_dek>:<iv_hex>:<ct_hex>
+            // Plaintext is the hex-encoded private key.
+            let parts: Vec<&str> = req
+                .old_envelope_blob
+                .strip_prefix("enc:v1:")
+                .expect("strip prefix succeeded in parse_old_envelope_prefix")
+                .split(':')
+                .collect();
+            if parts.len() != 3 {
+                old_dek.zeroize();
+                bail!("malformed v1 envelope: expected 3 fields, got {}", parts.len());
+            }
+            let iv = hex::decode(parts[1].trim_start_matches("0x"))
+                .context("hex-decode v1 IV")?;
+            let ciphertext = hex::decode(parts[2].trim_start_matches("0x"))
+                .context("hex-decode v1 ciphertext")?;
+            let plaintext = envelope::decrypt(&old_dek, &iv, &ciphertext)?;
+            old_dek.zeroize();
+
+            let pk_hex = std::str::from_utf8(&plaintext)
+                .map_err(|_| anyhow!("v1 plaintext is not UTF-8"))?;
+            let pk_bytes = hex::decode(pk_hex.trim().trim_start_matches("0x"))
+                .context("hex-decode EOA private key from v1 plaintext")?;
+            if pk_bytes.len() != 32 {
+                bail!("v1 priv key has length {} (want 32)", pk_bytes.len());
+            }
+            pk_bytes
+        }
+        OldEnvelopeKind::V2 => {
+            // v2 layout: enc:v2:<wrapped_dek>:<salt_b64>:<nonce_hex>:<ct_hex>:<tag_hex>
+            // Plaintext is the raw 32-byte private key. Caller must
+            // supply the user's existing password to authorise the
+            // migration — without it the AES-GCM tag check fails.
+            let password = req
+                .old_password
+                .as_ref()
+                .ok_or_else(|| {
+                    old_dek.zeroize();
+                    anyhow!("v2 → v3 migration requires the user's existing password")
+                })?;
+            let parts: Vec<&str> = req
+                .old_envelope_blob
+                .strip_prefix("enc:v2:")
+                .expect("strip prefix succeeded in parse_old_envelope_prefix")
+                .split(':')
+                .collect();
+            if parts.len() != 5 {
+                old_dek.zeroize();
+                bail!("malformed v2 envelope: expected 5 fields, got {}", parts.len());
+            }
+            let salt = B64.decode(parts[1]).context("decode v2 salt")?;
+            if salt.len() != password_derivation::SALT_LEN {
+                old_dek.zeroize();
+                bail!("v2 salt length {} (want {})", salt.len(), password_derivation::SALT_LEN);
+            }
+            let k_user = password_derivation::derive_user_key(password.as_bytes(), &salt)?;
+            let mut dek_arr = [0u8; 32];
+            dek_arr.copy_from_slice(&old_dek[..]);
+            let k_aes = password_derivation::combine_keys(&dek_arr, &k_user);
+            old_dek.zeroize();
+
+            let nonce_bytes = hex::decode(parts[2].trim_start_matches("0x"))
+                .context("hex-decode v2 nonce")?;
+            if nonce_bytes.len() != password_derivation::GCM_NONCE_LEN {
+                bail!("v2 nonce length {} (want {})", nonce_bytes.len(), password_derivation::GCM_NONCE_LEN);
+            }
+            let mut nonce_arr = [0u8; 12];
+            nonce_arr.copy_from_slice(&nonce_bytes);
+
+            let mut ct = hex::decode(parts[3].trim_start_matches("0x"))
+                .context("hex-decode v2 ct")?;
+            let tag = hex::decode(parts[4].trim_start_matches("0x"))
+                .context("hex-decode v2 tag")?;
+            ct.extend_from_slice(&tag);
+
+            let pt = password_derivation::aead_decrypt(&k_aes, &nonce_arr, &ct)?;
+            if pt.len() != 32 {
+                bail!("v2 plaintext length {} (want 32 raw)", pt.len());
+            }
+            pt.to_vec()
+        }
+    };
+
+    // ─── 4. Derive owner address from the recovered priv key ─────────
+    let signing_key = SigningKey::from_bytes((&priv_key[..]).into())
+        .map_err(|e| {
+            priv_key.zeroize();
+            anyhow!("recovered priv key rejected by k256: {e}")
+        })?;
+    let pubkey = signing_key.verifying_key();
+    let uncompressed = pubkey.to_encoded_point(false);
+    let xy = &uncompressed.as_bytes()[1..];
+    let hash = Keccak256::digest(xy);
+    let addr_bytes = &hash[12..];
+    let owner_address = format!("0x{}", hex::encode(addr_bytes));
+
+    // ─── 5. KMS-GenerateDataKey for a fresh DEK ──────────────────────
+    let mut rng = rand::rngs::OsRng;
+    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
+        .context("RSA-2048 keygen for migrate KMS-recipient channel")?;
+    let rsa_pub = RsaPublicKey::from(&rsa_priv);
+    let rsa_pub_der = rsa_pub
+        .to_public_key_der()
+        .context("encode RSA pubkey")?
+        .to_vec();
+    let mut nonce = [0u8; 32];
+    rng.fill_bytes(&mut nonce);
+    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce)
+        .context("NSM attestation for migrate")?;
+
+    let kms_req = KmsGenerateDataKeyRequest {
+        attestation_doc_b64: B64.encode(&*attestation_doc),
+        kms_key_arn: req.kms_key_arn.clone(),
+    };
+    let kms_resp = kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
+        .await
+        .context("parent KMS GenerateDataKey round trip (migrate)")?;
+    let (new_wrapped_dek_b64, cfr_b64) = match kms_resp {
+        KmsGenerateDataKeyResponse::Ok {
+            ciphertext_blob_b64,
+            ciphertext_for_recipient_b64,
+        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
+        KmsGenerateDataKeyResponse::Err { reason } => {
+            priv_key.zeroize();
+            bail!("parent KMS GenerateDataKey returned error: {reason}");
+        }
+    };
+    let cfr = B64.decode(&cfr_b64).context("base64-decode CiphertextForRecipient")?;
+    let mut new_dek = cms_unwrap_data_key(&rsa_priv, &cfr)
+        .context("CMS unwrap of CiphertextForRecipient")?;
+    if new_dek.len() != 32 {
+        new_dek.zeroize();
+        priv_key.zeroize();
+        bail!("new DEK length {} (want 32)", new_dek.len());
+    }
+    let mut new_dek_arr = [0u8; 32];
+    new_dek_arr.copy_from_slice(&new_dek[..]);
+    new_dek.zeroize();
+
+    // ─── 6. Convert enrolled methods + seal as v3 ────────────────────
+    let mut auth_methods: Vec<envelope_v3::AuthMethod> =
+        Vec::with_capacity(req.enrolled_methods.len());
+    for m in &req.enrolled_methods {
+        match m {
+            EnrolledMethod::Oidc { iss, sub } => {
+                auth_methods.push(envelope_v3::AuthMethod::Oidc {
+                    iss: iss.clone(),
+                    sub: sub.clone(),
+                });
+            }
+            EnrolledMethod::Passkey { cred_id_b64, cose_pubkey_b64 } => {
+                let cred_id = B64.decode(cred_id_b64).context("decode cred_id")?;
+                let cose = B64.decode(cose_pubkey_b64).context("decode cose")?;
+                webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose)
+                    .context("validate enrolled passkey COSE_Key")?;
+                auth_methods.push(envelope_v3::AuthMethod::Passkey { cred_id, cose });
+            }
+        }
+    }
+
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(&priv_key[..]);
+    priv_key.zeroize();
+
+    let mut new_nonce = [0u8; password_derivation::GCM_NONCE_LEN];
+    rng.fill_bytes(&mut new_nonce);
+
+    let new_blob = envelope_v3::seal(
+        &sk_arr,
+        auth_methods,
+        &new_dek_arr,
+        &new_nonce,
+        &new_wrapped_dek_b64,
+    )?;
+    sk_arr.zeroize();
+    new_dek_arr.zeroize();
+
+    info!(owner_address = %owner_address, "envelope migrated to v3 inside enclave");
+    Ok((new_blob, owner_address))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OldEnvelopeKind {
+    V1,
+    V2,
+}
+
+fn parse_old_envelope_prefix(blob: &str) -> Result<(String, OldEnvelopeKind)> {
+    if let Some(rest) = blob.strip_prefix("enc:v1:") {
+        let first = rest
+            .split_once(':')
+            .map(|(a, _)| a.to_string())
+            .ok_or_else(|| anyhow!("malformed v1 envelope"))?;
+        Ok((first, OldEnvelopeKind::V1))
+    } else if let Some(rest) = blob.strip_prefix("enc:v2:") {
+        let first = rest
+            .split_once(':')
+            .map(|(a, _)| a.to_string())
+            .ok_or_else(|| anyhow!("malformed v2 envelope"))?;
+        Ok((first, OldEnvelopeKind::V2))
+    } else if blob.starts_with("enc:v3:") {
+        bail!("envelope is already v3 — nothing to migrate");
+    } else {
+        bail!("envelope blob has no recognized version prefix")
+    }
 }
 
 // ─── Vsock framing + KMS proxy round-trip ────────────────────────────

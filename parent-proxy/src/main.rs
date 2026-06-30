@@ -62,6 +62,7 @@ const DEFAULT_ENCLAVE_CID: u32 = 16;
 const DEFAULT_ENCLAVE_PORT: u32 = 5005;
 const DEFAULT_KMS_PROXY_PORT: u32 = 5006;
 const DEFAULT_GENERATE_WALLET_PORT: u32 = 5007;
+const DEFAULT_MIGRATE_PORT: u32 = 5008;
 // Public by default so Railway smart-wallet can reach us. When you
 // want to keep this proxy localhost-only (smart-wallet on the same
 // host), set HTTP_BIND=127.0.0.1:7777 in the systemd env file.
@@ -75,6 +76,8 @@ struct AppState {
     /// from the sign port so a hung signing request doesn't starve
     /// account creation and vice versa.
     enclave_generate_wallet_port: u32,
+    /// Phase 3 — separate vsock port for v1/v2 → v3 envelope migration.
+    enclave_migrate_port: u32,
     #[allow(dead_code)]
     kms: Arc<KmsClient>,
 }
@@ -95,6 +98,7 @@ async fn main() -> Result<()> {
         "ENCLAVE_GENERATE_WALLET_PORT",
         DEFAULT_GENERATE_WALLET_PORT,
     );
+    let enclave_migrate_port = env_u32("ENCLAVE_MIGRATE_PORT", DEFAULT_MIGRATE_PORT);
     let kms_proxy_port = env_u32("KMS_PROXY_PORT", DEFAULT_KMS_PROXY_PORT);
     let http_bind = std::env::var("HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.to_string());
 
@@ -102,6 +106,7 @@ async fn main() -> Result<()> {
         enclave_cid,
         enclave_port,
         enclave_generate_wallet_port,
+        enclave_migrate_port,
         kms_proxy_port,
         http_bind = %http_bind,
         "starting rift-parent-proxy"
@@ -119,6 +124,7 @@ async fn main() -> Result<()> {
         enclave_cid,
         enclave_port,
         enclave_generate_wallet_port,
+        enclave_migrate_port,
         kms: kms.clone(),
     };
 
@@ -147,6 +153,10 @@ async fn main() -> Result<()> {
             "/generate-wallet",
             post(generate_wallet_handler).route_layer(middleware::from_fn(bearer_auth)),
         )
+        .route(
+            "/migrate-envelope",
+            post(migrate_envelope_handler).route_layer(middleware::from_fn(bearer_auth)),
+        )
         .route("/health", post(health_handler))
         .route("/health", axum::routing::get(health_handler))
         .with_state(state);
@@ -169,18 +179,49 @@ fn env_u32(name: &str, default: u32) -> u32 {
 // ─── HTTP signing frontend ──────────────────────────────────────────
 
 /// JSON body the smart-wallet sends to POST /sign.
+///
+/// Two envelope formats share this body shape:
+///   v1 (legacy KMS-only): set ciphertext_hex + iv_hex. Leave password,
+///        salt_b64, nonce_hex, tag_hex unset.
+///   v2 (password-bound, non-custodial): set ciphertext_hex, password,
+///        salt_b64, nonce_hex, tag_hex. Leave iv_hex unset.
+///
+/// The enclave picks the path. The parent-proxy is a pure pass-through.
 #[derive(Debug, Deserialize)]
 struct SignBody {
     /// 32-byte Safe UserOp hash, hex-encoded with or without 0x prefix.
     user_op_hash_hex: String,
-    /// Envelope's wrapped DEK, base64-encoded (from `enc:v1:<here>:...`).
+    /// Envelope's wrapped DEK, base64-encoded.
     wrapped_dek_b64: String,
     /// Envelope's ciphertext, hex-encoded.
     ciphertext_hex: String,
-    /// Envelope's IV, hex-encoded.
+    /// v1: the AES-CBC IV, hex-encoded (16 bytes). Empty string in v2.
+    #[serde(default)]
     iv_hex: String,
+    /// v2: the user's password (plaintext UTF-8). Empty in v1.
+    #[serde(default)]
+    password: Option<String>,
+    /// v2: HKDF salt, base64-encoded (32 bytes). Empty in v1.
+    #[serde(default)]
+    salt_b64: Option<String>,
+    /// v2: AES-GCM nonce, hex-encoded (12 bytes). Empty in v1.
+    #[serde(default)]
+    nonce_hex: Option<String>,
+    /// v2: AES-GCM auth tag, hex-encoded (16 bytes). Empty in v1.
+    #[serde(default)]
+    tag_hex: Option<String>,
     /// CMK ARN for the active mode (production/sandbox).
     kms_key_arn: String,
+
+    // ─── v3 (device-bound, no password) fields ──────────────────────
+    // When `v3_envelope_blob` is set the enclave ignores all v1/v2
+    // fields above. `auth_proof` carries the user's consent — either
+    // an OIDC id_token whose `nonce` is the user op hash, or a
+    // WebAuthn assertion challenged with the user op hash.
+    #[serde(default)]
+    v3_envelope_blob: Option<String>,
+    #[serde(default)]
+    auth_proof: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,7 +285,13 @@ async fn sign_handler(
             "wrapped_dek_b64": body.wrapped_dek_b64,
             "ciphertext_hex": body.ciphertext_hex,
             "iv_hex": body.iv_hex,
+            "password": body.password,
+            "salt_b64": body.salt_b64,
+            "nonce_hex": body.nonce_hex,
+            "tag_hex": body.tag_hex,
             "kms_key_arn": body.kms_key_arn,
+            "v3_envelope_blob": body.v3_envelope_blob,
+            "auth_proof": body.auth_proof,
         });
 
         match forward_to_enclave(state.enclave_cid, state.enclave_port, &enclave_req).await {
@@ -322,10 +369,23 @@ async fn forward_to_enclave(
 // ─── /generate-wallet HTTP handler ──────────────────────────────────
 
 /// JSON body the backend sends to POST /generate-wallet.
+///
+/// Format-selection cascade (first match wins):
+///   1. `enrolled_methods` non-empty → v3 (Passkey / OIDC bound)
+///   2. `password` present           → v2 (password-bound)
+///   3. otherwise                    → v1 (KMS-only, legacy)
+///
+/// The parent-proxy is a pass-through; the enclave does the picking.
 #[derive(Debug, Deserialize)]
 struct GenerateWalletBody {
     /// CMK to wrap the freshly-generated DEK with.
     kms_key_arn: String,
+    /// v2 path: the user's password.
+    #[serde(default)]
+    password: Option<String>,
+    /// v3 path: enrolled auth methods (OIDC and/or Passkey).
+    #[serde(default)]
+    enrolled_methods: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,6 +402,8 @@ async fn generate_wallet_handler(
     {
         let enclave_req = serde_json::json!({
             "kms_key_arn": body.kms_key_arn,
+            "password": body.password,
+            "enrolled_methods": body.enrolled_methods,
         });
 
         match forward_to_enclave(
@@ -398,6 +460,133 @@ async fn generate_wallet_handler(
             }
             Err(e) => {
                 error!(error = ?e, "forward to enclave (generate-wallet) failed");
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(SignError {
+                        error: format!("forward to enclave: {e:#}"),
+                    }),
+                ))
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, body);
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SignError {
+                error: "parent proxy only runs on Linux".to_string(),
+            }),
+        ))
+    }
+}
+
+// ─── /migrate-envelope HTTP handler ─────────────────────────────────
+//
+// Upgrade an existing v1 or v2 envelope to v3 without ever touching
+// the plaintext private key. Backend posts the OLD envelope blob and
+// the user's newly-enrolled auth methods (Passkey / OIDC); the enclave
+// decrypts the old envelope, re-seals under v3 with a fresh DEK, and
+// returns the new blob.
+
+/// JSON body backend posts to POST /migrate-envelope.
+#[derive(Debug, Deserialize)]
+struct MigrateBody {
+    /// CMK ARN for the active mode.
+    kms_key_arn: String,
+    /// The existing envelope blob — `enc:v1:...` or `enc:v2:...`.
+    old_envelope_blob: String,
+    /// Required if `old_envelope_blob` is v2 — proves migration is
+    /// user-authorised. The enclave's GCM tag check fails on a wrong
+    /// password and surfaces as a generic "invalid credentials" error.
+    #[serde(default)]
+    old_password: Option<String>,
+    /// Enrolled auth methods for the new v3 envelope. Must be non-empty.
+    enrolled_methods: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct MigrateSuccess {
+    envelope_blob: String,
+    owner_address: String,
+}
+
+async fn migrate_envelope_handler(
+    State(state): State<AppState>,
+    Json(body): Json<MigrateBody>,
+) -> Result<Json<MigrateSuccess>, (StatusCode, Json<SignError>)> {
+    #[cfg(target_os = "linux")]
+    {
+        if body.enrolled_methods.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(SignError {
+                    error: "enrolled_methods must be non-empty".to_string(),
+                }),
+            ));
+        }
+        let enclave_req = serde_json::json!({
+            "kms_key_arn": body.kms_key_arn,
+            "old_envelope_blob": body.old_envelope_blob,
+            "old_password": body.old_password,
+            "enrolled_methods": body.enrolled_methods,
+        });
+
+        match forward_to_enclave(
+            state.enclave_cid,
+            state.enclave_migrate_port,
+            &enclave_req,
+        )
+        .await
+        {
+            Ok(resp) => {
+                if let Some(ok) = resp.get("Ok") {
+                    let envelope_blob = ok
+                        .get("envelope_blob")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let owner_address = ok
+                        .get("owner_address")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if envelope_blob.is_empty() || owner_address.is_empty() {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            Json(SignError {
+                                error: format!("malformed enclave response: {resp}"),
+                            }),
+                        ));
+                    }
+                    Ok(Json(MigrateSuccess {
+                        envelope_blob,
+                        owner_address,
+                    }))
+                } else if let Some(err) = resp
+                    .get("Err")
+                    .and_then(|e| e.get("reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    warn!(reason = %err, "enclave migrate-envelope returned error");
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(SignError {
+                            error: format!("enclave: {err}"),
+                        }),
+                    ))
+                } else {
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(SignError {
+                            error: format!("malformed enclave response: {resp}"),
+                        }),
+                    ))
+                }
+            }
+            Err(e) => {
+                error!(error = ?e, "forward to enclave (migrate-envelope) failed");
                 Err((
                     StatusCode::BAD_GATEWAY,
                     Json(SignError {

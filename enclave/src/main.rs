@@ -24,8 +24,14 @@
 //! development, but `main()` exits immediately with a friendly hint.
 
 mod envelope;
+mod envelope_v2;
+mod envelope_v3;
+mod oidc_verification;
+mod password_derivation;
+mod pinned_jwks;
 mod protocol;
 mod signing;
+mod webauthn_verification;
 
 #[cfg(target_os = "linux")]
 mod attestation;
@@ -48,6 +54,10 @@ mod linux_main {
     /// from the sign port so a hung sign connection can't starve account
     /// creation and vice versa.
     pub const ENCLAVE_GENERATE_WALLET_PORT: u32 = 5007;
+    /// Phase 3 — vsock port for v1/v2 → v3 envelope migration.
+    /// Separate again so a stuck migration cannot starve sign or
+    /// account creation.
+    pub const ENCLAVE_MIGRATE_PORT: u32 = 5008;
 
     pub async fn run() -> anyhow::Result<()> {
         tracing_subscriber::fmt()
@@ -70,6 +80,7 @@ mod linux_main {
         vsock_server::serve(
             ENCLAVE_VSOCK_PORT,
             ENCLAVE_GENERATE_WALLET_PORT,
+            ENCLAVE_MIGRATE_PORT,
             PARENT_CID,
             PARENT_KMS_PROXY_PORT,
         )

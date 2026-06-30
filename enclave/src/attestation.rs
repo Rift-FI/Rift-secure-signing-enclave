@@ -17,9 +17,10 @@
 //! Implementation: thin wrapper around the upstream
 //! `aws-nitro-enclaves-nsm-api` crate.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use aws_nitro_enclaves_nsm_api::api::{Request as NsmRequest, Response as NsmResponse};
 use aws_nitro_enclaves_nsm_api::driver as nsm_driver;
+use ciborium::value::Value as CborValue;
 use std::sync::OnceLock;
 use zeroize::Zeroizing;
 
@@ -67,4 +68,54 @@ pub fn attest(public_key: &[u8], nonce: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         other => Err(anyhow!("unexpected NSM response: {:?}", other)),
     }
     .context("attestation document generation")
+}
+
+/// Same as `attest` but also returns the document's embedded trusted
+/// timestamp as Unix seconds.
+///
+/// The attestation doc is a COSE_Sign1 array [protected, unprotected,
+/// payload, signature]. The payload is itself a CBOR map signed by
+/// the NSM, with `timestamp` (milliseconds since epoch) among the
+/// claims. We extract that value so v3 OIDC verification has a trusted
+/// "now" — using the host's wall clock would let a compromised host
+/// extend the apparent validity window of an OIDC token.
+pub fn attest_with_timestamp(public_key: &[u8], nonce: &[u8]) -> Result<(Zeroizing<Vec<u8>>, i64)> {
+    let doc = attest(public_key, nonce)?;
+    let ts = parse_attestation_timestamp(&doc)?;
+    Ok((doc, ts))
+}
+
+fn parse_attestation_timestamp(doc: &[u8]) -> Result<i64> {
+    let outer: CborValue = ciborium::de::from_reader(doc)
+        .map_err(|e| anyhow!("decode attestation doc as CBOR: {e}"))?;
+    let arr = outer
+        .as_array()
+        .ok_or_else(|| anyhow!("attestation doc is not a COSE_Sign1 array"))?;
+    if arr.len() != 4 {
+        bail!("COSE_Sign1 must be a 4-element array, got {}", arr.len());
+    }
+    // Element 2 is the payload bytes (a serialized CBOR map).
+    let payload_bytes = arr[2]
+        .as_bytes()
+        .ok_or_else(|| anyhow!("COSE_Sign1 payload is not bytes"))?;
+    let payload: CborValue = ciborium::de::from_reader(payload_bytes.as_slice())
+        .map_err(|e| anyhow!("decode attestation payload CBOR: {e}"))?;
+    let map = payload
+        .as_map()
+        .ok_or_else(|| anyhow!("attestation payload is not a map"))?;
+    for (k, v) in map {
+        if let Some(s) = k.as_text() {
+            if s == "timestamp" {
+                if let Some(i) = v.as_integer() {
+                    let millis = i128::from(i);
+                    let secs = millis.checked_div(1000)
+                        .ok_or_else(|| anyhow!("attestation timestamp overflow"))?;
+                    let secs_i64 = i64::try_from(secs)
+                        .map_err(|_| anyhow!("attestation timestamp does not fit in i64"))?;
+                    return Ok(secs_i64);
+                }
+            }
+        }
+    }
+    bail!("attestation payload missing `timestamp` field")
 }

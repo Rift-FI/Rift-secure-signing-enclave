@@ -30,9 +30,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "ne
 # Crypto — same versions across both binaries so the AES/RSA wire format
 # can't drift.
 aes = "0.8"
+aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["std"] }
 cipher = "0.4"
+hkdf = "0.12"
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+# p256 is needed for ES256 OIDC tokens (Apple's id_tokens) and for the
+# vast majority of WebAuthn assertions (COSE algorithm -7).
+p256 = { version = "0.13", features = ["ecdsa"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 sha3 = "0.10"

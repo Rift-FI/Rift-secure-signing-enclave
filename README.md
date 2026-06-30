@@ -1,149 +1,209 @@
 # rift-signer-enclave
 
-A tiny Rust binary that runs inside an [AWS Nitro Enclave](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html) and does exactly one thing: **decrypt envelope-encrypted EOA private keys via KMS attestation and sign Safe UserOperation hashes** for the Rift smart-wallet service.
+The Rust binary that runs inside an AWS Nitro Enclave and signs Safe
+UserOperations for Rift, plus generates fresh EOAs on demand. It is
+the only process anywhere in the Rift stack that ever sees a user's
+plaintext private key.
 
-This is Phase 1 of Rift's key-management roadmap (Phase 0 = at-rest KMS envelope in the DB; Phase 0.5 = envelope-over-HTTPS to smart-wallet; Phase 1 = signing happens inside an attested enclave so even AWS root can't see the plaintext).
+The repo contains two binaries:
+
+1. The enclave itself (the rift-signer-enclave binary, built into an
+   EIF and launched with nitro-cli). Runs inside the TEE. Has no
+   network. Talks to the parent only over vsock.
+2. The parent-proxy (rift-parent-proxy, built into a regular Linux
+   binary and run as a systemd unit on the EC2 host). Bridges HTTP
+   from the outside world to vsock in to the enclave, and bridges
+   vsock from the enclave out to AWS KMS over HTTPS.
+
+This README covers the threat model, the on-the-wire protocols
+between the three actors (backend or smart-wallet, parent-proxy,
+enclave), the build pipeline, and the deploy steps.
 
 ## Why this exists
 
-| Risk | Pre-Phase-0 | After Phase 0/0.5 | After Phase 1 (this) |
-|---|---|---|---|
-| `ENCRYPTION_KEY` env var leak | Drains every user | No-op; KMS access required | No-op |
-| Backend/smart-wallet HTTPS plaintext intercept | Plaintext key in body | Opaque envelope | Opaque envelope |
-| Backend or smart-wallet host root compromise | Plaintext keys in process memory | Plaintext keys in process memory | **Not visible — keys only ever in enclave RAM** |
-| AWS IAM credentials leak | n/a | KMS Decrypt callable | Decrypt succeeds but plaintext is encrypted-to-enclave-public-key; only this exact enclave image can use it |
+Pre-Phase 0, every Rift user's EOA private key was AES-encrypted at
+rest with a single ENCRYPTION_KEY environment variable. Anyone who
+got that env var (a leak, a curious employee, a compromised CI run)
+could decrypt every user's wallet.
 
-The PCR0 of this enclave image is pinned in the KMS CMK's key policy. KMS releases plaintext **only** to attestation documents signed by NSM and reporting that exact PCR0. So:
+Phase 0 moved the at-rest format to a KMS envelope: each user's key
+is AES-encrypted with a fresh data encryption key, and that DEK is
+itself KMS-wrapped. To decrypt, you need IAM access to call
+kms:Decrypt on the CMK. The plaintext ENCRYPTION_KEY stops being
+load-bearing for new rows.
 
-- ✅ Even AWS itself can't decrypt by reading the ciphertext
-- ✅ Even with full IAM access to your account, an attacker can't decrypt without running the exact enclave image
-- ✅ Even if you accidentally deploy a malicious enclave image, the new PCR0 won't match and KMS refuses
+Phase 0.5 closed the wire surface. Backend used to send plaintext
+private keys to the smart-wallet over HTTPS. Now it sends the
+envelope blob, and the smart-wallet does the KMS Decrypt in process.
+
+Phase 1 closed the in-process surface. Instead of any Node process
+holding the plaintext in memory for the duration of a sign call, the
+plaintext lives only inside a Nitro Enclave that nobody (including
+AWS, including Rift) can introspect. KMS releases the wrapped DEK
+only to attestation documents whose PCR0 hash matches a specific
+allowlist in the CMK key policy. So even with full IAM access, you
+cannot decrypt unless you can also run an enclave image with the
+exact same hash. Rebuild the EIF with a different toolchain or any
+code change and the hash changes and KMS refuses.
+
+Phase 2 added wallet generation to the enclave. Before Phase 2,
+fresh EOAs were generated in the backend with ethers.Wallet.createRandom
+and immediately KMS-encrypted. The plaintext lived in Node RAM for a
+few milliseconds. Phase 2 moves the generation inside the enclave
+too. The backend asks the parent-proxy "generate me a wallet", the
+enclave does it end to end (RSA ephemeral key, NSM attest, KMS
+GenerateDataKey with recipient, build envelope blob, return), and
+the backend never sees the private key at any point in its life.
+
+| Risk | Pre-Phase 0 | Phase 0/0.5 | Phase 1 | Phase 2 |
+|---|---|---|---|---|
+| ENCRYPTION_KEY env var leak | Drains every user | No-op for new rows | No-op | No-op |
+| Backend or smart-wallet HTTPS plaintext intercept | Plaintext in body | Opaque envelope | Opaque envelope | Opaque envelope |
+| Backend or smart-wallet host root compromise | Plaintext in process memory | Plaintext in process memory | Not visible (signing happens in enclave) | Not visible (signing and keygen happen in enclave) |
+| AWS IAM credentials leak | n/a | KMS Decrypt callable directly | KMS only releases plaintext to the attested enclave PCR0 | Same plus GenerateDataKey is gated the same way |
 
 ## Architecture
 
 ```
-                  ┌──────────────────────────────────────────┐
-                  │ EC2 c6g.large (Amazon Linux 2023)        │
-   HTTPS ───────► │ ┌──────────────────────────────────────┐ │
-   from backend   │ │ Parent process (Node, separate repo) │ │
-                  │ │ - HTTPS frontend                     │ │
-                  │ │ - Pimlico API, UserOp encoding       │ │
-                  │ │ - vsock client → enclave             │ │
-                  │ │ - vsock server ← enclave (KMS proxy) │ │
-                  │ └────────────────┬─────────────────────┘ │
-                  │                  │ vsock                 │
-                  │ ┌────────────────▼─────────────────────┐ │
-                  │ │ rift-signer-enclave (THIS REPO)      │ │
-                  │ │ ─────────────────────────────────────│ │
-                  │ │ 1. recv {userOpHash, envelope}        │ │
-                  │ │ 2. NSM attest(ephemeral_pubkey)       │ │
-                  │ │ 3. ─→ parent → KMS Decrypt(attest,    │ │
-                  │ │       wrapped_dek)                    │ │
-                  │ │ 4. ←─ CiphertextForRecipient          │ │
-                  │ │ 5. RSA-OAEP unwrap → plaintext DEK    │ │
-                  │ │ 6. AES-256-CBC decrypt envelope       │ │
-                  │ │ 7. secp256k1 sign userOpHash          │ │
-                  │ │ 8. zeroize everything                 │ │
-                  │ │ 9. return 65-byte signature           │ │
-                  │ └──────────────────────────────────────┘ │
-                  └──────────────────────────────────────────┘
+                  EC2 c6g.large (Amazon Linux 2023)
+                  +------------------------------------------+
+                  |  rift-parent-proxy (systemd unit)        |
+   HTTPS in  ---> |   POST /sign              POST /gen-wallet
+   from           |    |                          |          |
+   backend or    -|----+--------------------------+----------|
+   smart-wallet   |   vsock to enclave (ports 5005 and 5007) |
+                  |                       ^                  |
+                  |                       |                  |
+                  |   vsock from enclave  | (port 5006)      |
+                  |   carrying KMS-proxy  |                  |
+                  |   requests            |                  |
+                  |   (Decrypt or         |                  |
+                  |    GenerateDataKey)   |                  |
+                  |          |            |                  |
+                  |          v            |                  |
+                  |   HTTPS to AWS KMS    |                  |
+                  +------------------------------------------+
+                                          |
+                                          |
+                  +------------------------------------------+
+                  |  rift-signer-enclave (the EIF)           |
+                  |  No network, no disk.                    |
+                  |  Two vsock listeners:                    |
+                  |   - port 5005 sign loop                  |
+                  |   - port 5007 generate-wallet loop       |
+                  |  Crypto primitives:                      |
+                  |   - RSA-2048 keygen (for KMS recipient)  |
+                  |   - NSM attestation document             |
+                  |   - CMS EnvelopedData unwrap (openssl)   |
+                  |   - AES-256-CBC decrypt / encrypt        |
+                  |   - secp256k1 sign_prehash               |
+                  |   - keccak256 (for EVM address derive)   |
+                  +------------------------------------------+
 ```
+
+The PCR0 of the EIF is pinned in the KMS CMK key policy. KMS releases
+plaintext only to attestation documents signed by NSM that report
+that exact PCR0. Two consequences:
+
+- AWS itself cannot decrypt by reading the ciphertext.
+- Even with full IAM access to the account, an attacker cannot
+  decrypt without running the exact enclave image. A different image
+  produces a different PCR0 and KMS refuses.
+- If you accidentally deploy a malicious enclave image, the new PCR0
+  will not match and KMS refuses. You have to add it to the policy
+  on purpose.
 
 ## Repo layout
 
 ```
 .
-├── Cargo.toml                # Rust manifest; pinned deps for build reproducibility
-├── rust-toolchain.toml       # Pins rustc version — changing this changes PCR0
-├── Dockerfile                # Multi-stage build → enclave runtime image
-├── Makefile                  # build / eif / run / pcr0 / kill
-├── src/
-│   ├── main.rs               # entry point, tracing setup, vsock listener
-│   ├── protocol.rs           # SignRequest / SignResponse / KmsDecryptRequest
-│   ├── attestation.rs        # NSM attestation document generation
-│   ├── envelope.rs           # AES-256-CBC of the envelope payload
-│   ├── signing.rs            # secp256k1 sign_prehash
-│   └── vsock_server.rs       # accept loop, frame I/O, signing pipeline
-└── README.md (this file)
++-- Cargo.toml                Rust manifest, pinned deps for reproducibility
++-- rust-toolchain.toml       Pins rustc version. Changing this changes PCR0.
++-- Dockerfile                Multi-stage build of the enclave runtime image
++-- Makefile                  build / eif / run / pcr0 / kill targets
++-- enclave/
+|   +-- src/
+|       +-- main.rs           entry point, tracing, vsock listener
+|       +-- protocol.rs       SignRequest / GenerateWalletRequest types
+|       +-- attestation.rs    NSM attestation document generation
+|       +-- envelope.rs       AES-256-CBC of the envelope payload
+|       +-- signing.rs        secp256k1 sign_prehash
+|       +-- vsock_server.rs   accept loop, framing, sign + generate-wallet pipelines
++-- parent-proxy/
+|   +-- src/
+|       +-- main.rs           HTTPS frontend, vsock client (out), vsock server (KMS proxy)
++-- systemd/
+    +-- rift-parent-proxy.service
 ```
 
-## Local development (Mac / Windows)
+## Wire protocols
 
-The crate is split so that 80% of dev happens locally with fast feedback, and only the actual enclave build needs the EC2.
+All three flows use length-prefixed JSON over vsock. The HTTPS
+front-end at the parent-proxy speaks plain JSON. Bearer-token
+auth on all HTTPS endpoints.
 
-| Command | Where | What it does |
-|---|---|---|
-| `cargo check` | Windows / Mac / Linux | Typecheck. ~5s feedback. Catches the majority of bugs. |
-| `cargo test` | Windows / Mac / Linux | Unit tests for `signing.rs` (sign + recover-pubkey round trip) and `envelope.rs` (AES round trip vs known DEK). |
-| `make eif` | EC2 only | Build the Docker image + convert to EIF. Requires `/dev/nsm` + `nitro-cli`. |
-| `make run-debug` | EC2 only | Boot the enclave + tail console output. |
+### POST /sign (HTTP, parent-proxy)
 
-The split is enforced by `cfg(target_os = "linux")` gates on the modules that touch `/dev/nsm` (`attestation.rs`) and vsock sockets (`vsock_server.rs`). On Windows / Mac those modules don't compile, the binary's `main()` just prints a friendly "build on Linux" message, but the portable modules (`signing.rs`, `envelope.rs`, `protocol.rs`) compile and run their tests fine.
+What the smart-wallet posts when it needs a Safe UserOperation
+signature.
 
-**Recommended inner loop**:
-
-1. Edit code locally in your IDE.
-2. `cargo check` — typecheck.
-3. `cargo test` — run the portable unit tests.
-4. Once satisfied, `git push`.
-5. SSM to the EC2 → `git pull` → `make eif` → measure new PCR0 → run-debug to integration test.
-
-## Building on the EC2
-
-Prereqs already installed in Phase 1 step 2: `docker`, `nitro-cli`, the Nitro Enclaves allocator service running, your user in the `ne` group (or just `sudo`).
-
-```sh
-git clone <repo-url>
-cd rift-signer-enclave
-make eif
-```
-
-Output ends with a measurements block:
-
-```
-"Measurements": {
-  "PCR0": "<long hex>",
-  ...
-}
-```
-
-**Save the PCR0.** That hex string is what we'll add to the KMS CMK key policy in Phase 1 step 5 — the condition that gates plaintext release on this exact image.
-
-## Running it
-
-```sh
-make run-debug   # enclave + console output visible via `make console`
-make describe    # show running enclaves
-make console     # tail the enclave's stdout (debug-mode only)
-make kill        # terminate
-```
-
-Default allocation is 1 vCPU + 1024 MiB. Override per-invocation:
-
-```sh
-ENCLAVE_MEMORY_MIB=2048 make run-debug
-```
-
-## Wire protocol
-
-Vsock, length-prefixed JSON. See `src/protocol.rs` for the exact shapes.
-
-**Parent → enclave (port 5005):**
+Request body:
 
 ```json
 {
-  "user_op_hash_hex": "0x...",            // 32-byte Safe UserOp hash
-  "wrapped_dek_b64": "...",               // KMS-wrapped DEK from envelope
-  "ciphertext_hex": "...",                // envelope payload
-  "iv_hex": "...",                        // envelope IV
-  "kms_key_arn": "arn:aws:kms:..."        // for parent's KMS proxy routing
+  "user_op_hash_hex": "0x<32 bytes hex>",
+  "wrapped_dek_b64": "<base64 of KMS-wrapped DEK from the envelope>",
+  "ciphertext_hex": "<hex of AES ciphertext from the envelope>",
+  "iv_hex": "<hex of the 16-byte AES IV>",
+  "kms_key_arn": "arn:aws:kms:us-east-1:<account>:key/<key-id>"
 }
 ```
 
-**Enclave → parent (response):**
+Response:
 
 ```json
-{ "Ok": { "signature_hex": "0x<r><s><v>" } }
+{ "signature_hex": "0x<r 32 bytes><s 32 bytes><v 1 byte>" }
+```
+
+v is 27 or 28.
+
+### POST /generate-wallet (HTTP, parent-proxy)
+
+What the backend posts when it needs to provision a new EOA for a
+user.
+
+Request body:
+
+```json
+{ "kms_key_arn": "arn:aws:kms:us-east-1:<account>:key/<key-id>" }
+```
+
+Response:
+
+```json
+{
+  "envelope_blob": "enc:v1:<wrapped_dek_b64>:<iv_hex>:<ciphertext_hex>",
+  "owner_address": "0x<lowercase 40-char hex>"
+}
+```
+
+The envelope_blob is byte-for-byte the same shape the backend's
+encryptKey() helper produces, so storing it directly in
+encrypted_keys.encryptedKeys works and any decryption path that
+already exists (the enclave's /sign path, the smart-wallet's
+in-process KMS path, the backend's legacy decryptKey) works against
+it without modification.
+
+### Vsock between parent-proxy and enclave
+
+Two ports:
+
+- Port 5005: sign requests in, signed-userOp-hash out. The body is
+  the SignRequest JSON above wrapped in a length prefix. The reply
+  is a SignResponse enum, JSON shape:
+
+```json
+{ "Ok": { "signature_hex": "0x..." } }
 ```
 
 or
@@ -152,29 +212,234 @@ or
 { "Err": { "reason": "..." } }
 ```
 
-**Enclave → parent (port 5006, KMS proxy round trip):**
+- Port 5007: generate-wallet requests in, envelope-plus-address out.
+  Same length-prefixed JSON shape.
 
-The enclave initiates this connection when it needs a KMS Decrypt; the parent forwards the call to the real KMS endpoint and returns the CiphertextForRecipient.
+### Vsock from enclave back to parent-proxy (KMS proxy)
 
-## Status
+The enclave has no network. When it needs to call KMS, it opens a
+fresh vsock connection to the parent's KMS proxy on port 5006 and
+sends a tagged enum:
 
-This repo currently scaffolds the runtime: vsock listener, framing, NSM init, signing primitive, envelope AES decrypt. **The real KMS attested-decrypt flow is stubbed** (see `vsock_server.rs::process` and the `TODO(rift-1)` marker). Next session wires:
+```json
+{ "op": "Decrypt", "attestation_doc_b64": "...", "wrapped_dek_b64": "...", "kms_key_arn": "..." }
+```
 
-1. ephemeral RSA-2048 keypair generation per request
-2. NSM attestation with embedded public key
-3. vsock round-trip to the parent's KMS proxy
-4. RSA-OAEP-SHA-256 unwrap of CiphertextForRecipient
-5. envelope::decrypt + signing::sign_user_op_hash
-6. hex-encoded signature back to the parent
+or
 
-After that, the parent proxy gets built (separate repo / directory).
+```json
+{ "op": "GenerateDataKey", "attestation_doc_b64": "...", "kms_key_arn": "..." }
+```
 
-## Threat model out of scope (Phase 2+)
+The parent calls AWS KMS over HTTPS with the appropriate operation
+and returns the result. For Decrypt the response carries
+CiphertextForRecipient (RSA-OAEP-SHA-256 encrypted to the public key
+inside the attestation doc). For GenerateDataKey it carries both
+CiphertextBlob (the KMS-wrapped DEK, goes verbatim into the
+envelope) and CiphertextForRecipient (the RSA-OAEP-wrapped plaintext
+DEK that the enclave unwraps to actually use).
 
-- **Side-channel attacks on Graviton SEV-SNP**: Nitro's threat model assumes hardware integrity. We don't try to defend against speculation-style attacks.
-- **Insider with AWS root + ability to silently sub a malicious enclave image**: KMS attestation defends against this for the data path, but if an insider can both push a malicious image AND update the KMS key policy to trust its PCR0, they bypass us. Mitigation lives in IAM / SCP land, not here.
-- **Catastrophic loss of the CMK**: handled separately by the multi-region replicated break-glass backup CMK (Phase 1 step 7).
+The recipient encryption is what makes the parent process truly
+unable to see plaintext, even though it is the network proxy. The
+parent forwards bytes whose recipient is the enclave's ephemeral
+public key. Only the enclave can decrypt them.
+
+### Inside the enclave: sign pipeline
+
+```
+1. Receive SignRequest on vsock 5005.
+2. Generate ephemeral RSA-2048 keypair (private key never leaves
+   this function's stack).
+3. NSM attest(ephemeral RSA pubkey, random nonce) returns the
+   COSE_Sign1 attestation document.
+4. Build a KmsProxyRequest::Decrypt and send to vsock 5006.
+5. Parent calls kms:Decrypt with the attestation document in the
+   Recipient field.
+6. KMS verifies PCR0 against the key policy and, if it matches,
+   returns CiphertextForRecipient (CMS EnvelopedData, RSA-OAEP'd
+   to the recipient pubkey).
+7. CMS unwrap with openssl (BER-aware, the pure-Rust crates only do
+   strict DER which KMS does not produce) to recover the plaintext
+   DEK.
+8. AES-256-CBC decrypt the envelope's ciphertext_hex with the DEK
+   and iv_hex to recover the EOA private key as UTF-8 hex.
+9. Parse the hex into 32 raw bytes, secp256k1.sign_prehash the
+   userOpHash with recovery, produce the 65-byte (r, s, v) signature.
+10. Zeroize the DEK and the private key bytes.
+11. Reply with SignResponse::Ok.
+```
+
+### Inside the enclave: generate-wallet pipeline
+
+```
+1. Receive GenerateWalletRequest on vsock 5007.
+2. Generate ephemeral RSA-2048 keypair (for the KMS recipient
+   channel).
+3. NSM attest(RSA pubkey, random nonce).
+4. Build a KmsProxyRequest::GenerateDataKey and send to vsock 5006.
+5. Parent calls kms:GenerateDataKey with the attestation Recipient.
+6. KMS verifies PCR0, returns CiphertextBlob (the KMS-wrapped DEK
+   to store in the envelope) and CiphertextForRecipient (the
+   RSA-OAEP-wrapped plaintext DEK for the enclave to use right now).
+7. CMS unwrap CiphertextForRecipient to get the plaintext DEK.
+8. Generate a fresh secp256k1 keypair entirely inside the enclave.
+9. Derive the EVM owner address: keccak256(uncompressed_pubkey[1..])
+   then take the last 20 bytes. Hex-encode with 0x prefix.
+10. Generate a random 16-byte IV. AES-256-CBC encrypt the secp256k1
+    private key (encoded as 0x<64 hex chars> UTF-8 string) with the
+    DEK and the IV.
+11. Assemble the envelope blob:
+    enc:v1:<base64 of KMS CiphertextBlob>:<hex of IV>:<hex of AES ciphertext>
+12. Zeroize the DEK and the secp256k1 private key bytes.
+13. Reply with GenerateWalletResponse::Ok(envelope_blob, owner_address).
+```
+
+The point: the plaintext secp256k1 private key exists only on the
+enclave's stack for the duration of step 10. It never crosses any
+vsock boundary, never goes to KMS, never leaves the TEE.
+
+## Local development (Mac or Windows)
+
+The portable modules compile and run their unit tests on any
+platform. Linux-only code (NSM, vsock, openssl-vendored) is gated by
+cfg(target_os = "linux"), so cargo check on Mac or Windows
+typechecks the whole repo but skips the gated modules.
+
+| Command | Where | What it does |
+|---|---|---|
+| cargo check --workspace | any platform | Typecheck. About 5 to 10 seconds after the first build. |
+| cargo test | any platform | Unit tests for signing.rs and envelope.rs round trips. |
+| make eif | EC2 only | Build the Docker image and convert to EIF. |
+| make run-debug | EC2 only | Launch the enclave in debug mode. |
+| make console | EC2 only | Tail the enclave's stdout. |
+| make kill | EC2 only | Terminate any running enclaves. |
+| make pcr0 | EC2 only | Print the EIF's PCR0 hash. |
+
+Recommended inner loop:
+
+1. Edit code in your IDE.
+2. cargo check on your laptop.
+3. cargo test on your laptop.
+4. Commit, push.
+5. SSH to the EC2 (or use AWS Session Manager), git pull, make eif,
+   capture the new PCR0, integration test.
+
+## Building on the EC2
+
+Prereqs already installed in Phase 1 step 2: docker, nitro-cli, the
+Nitro Enclaves allocator service running with at least 1 vCPU and
+1024 MiB allocated.
+
+```sh
+git clone <repo>
+cd rift-signer-enclave
+make eif
+```
+
+The build runs Cargo inside a Debian container, so the host's
+toolchain choices do not affect PCR0. Output ends with a
+measurements block:
+
+```json
+{
+  "Measurements": {
+    "PCR0": "<96 hex chars>",
+    "PCR1": "...",
+    "PCR2": "..."
+  }
+}
+```
+
+Save the PCR0. It is what you add to the KMS CMK key policy.
+
+## Configuring KMS
+
+Two statements per CMK (sandbox and production):
+
+```json
+{
+  "Sid": "AllowAttestedDecryptFromSignerEnclave",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<account>:role/rift-signer-enclave-role" },
+  "Action": "kms:Decrypt",
+  "Resource": "*",
+  "Condition": {
+    "StringEqualsIgnoreCase": {
+      "kms:RecipientAttestation:ImageSha384": "<your PCR0>"
+    }
+  }
+}
+```
+
+```json
+{
+  "Sid": "AllowAttestedGenerateDataKeyFromSignerEnclave",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<account>:role/rift-signer-enclave-role" },
+  "Action": "kms:GenerateDataKey",
+  "Resource": "*",
+  "Condition": {
+    "StringEqualsIgnoreCase": {
+      "kms:RecipientAttestation:ImageSha384": "<your PCR0>"
+    }
+  }
+}
+```
+
+The IAM role on the EC2 instance (rift-signer-enclave-role in our
+infra) also needs an identity-based policy allowing kms:Decrypt and
+kms:GenerateDataKey on the same CMK ARN. Without both the policy on
+the key and the policy on the principal, the call is denied.
+
+## Deploying
+
+Once the EIF is built and the KMS policies are in place:
+
+```sh
+make kill                       # stop any old enclave
+make install-parent-proxy       # rebuild + install the parent-proxy binary and unit
+sudo systemctl restart rift-parent-proxy
+make run-debug                  # bring up the new enclave
+make console                    # in another shell, tail the enclave
+```
+
+Important: nitro-cli assigns enclave CIDs sequentially. Each
+make run-debug bumps the CID by 1. The parent-proxy reads
+ENCLAVE_CID from /etc/rift-parent-proxy.env. If the new enclave is
+at CID 20 and the env file still says ENCLAVE_CID=19, the
+parent-proxy will time out trying to reach it. Update the env file
+and systemctl restart rift-parent-proxy after each launch.
+
+Smoke test:
+
+```sh
+curl -sS -X POST http://127.0.0.1:7777/generate-wallet \
+  -H "Authorization: Bearer $PARENT_PROXY_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"kms_key_arn":"<your CMK ARN>"}'
+```
+
+Expected:
+
+```json
+{
+  "envelope_blob": "enc:v1:AQID...:0a1b...:8f9e...",
+  "owner_address": "0x..."
+}
+```
+
+## Threat model out of scope
+
+- Side-channel attacks on Graviton SEV-SNP. Nitro's threat model
+  assumes hardware integrity. We do not defend against speculation
+  or microarchitectural attacks.
+- An insider who can both push a malicious enclave image and update
+  the KMS key policy to trust its PCR0. KMS attestation defends
+  against this for the data path, but if the same person can do
+  both, they bypass us. Mitigation lives in IAM and SCP, not here.
+- Catastrophic loss of the CMK. Handled separately by a multi-region
+  replicated break-glass backup CMK (Phase 1 step 7).
 
 ## License
 
-Proprietary. See LICENSE (TBD).
+Proprietary. See LICENSE.
