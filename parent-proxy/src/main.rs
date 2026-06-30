@@ -191,11 +191,16 @@ fn env_u32(name: &str, default: u32) -> u32 {
 struct SignBody {
     /// 32-byte Safe UserOp hash, hex-encoded with or without 0x prefix.
     user_op_hash_hex: String,
-    /// Envelope's wrapped DEK, base64-encoded.
+    /// v1 / v2: envelope's wrapped DEK, base64-encoded. Absent for v3 —
+    /// v3 carries the wrapped DEK inside `v3_envelope_blob`, not as a
+    /// top-level field. `#[serde(default)]` so v3 requests deserialize.
+    #[serde(default)]
     wrapped_dek_b64: String,
-    /// Envelope's ciphertext, hex-encoded.
+    /// v1 / v2: envelope's ciphertext, hex-encoded. Absent for v3 for
+    /// the same reason as `wrapped_dek_b64`.
+    #[serde(default)]
     ciphertext_hex: String,
-    /// v1: the AES-CBC IV, hex-encoded (16 bytes). Empty string in v2.
+    /// v1: the AES-CBC IV, hex-encoded (16 bytes). Empty string in v2 / v3.
     #[serde(default)]
     iv_hex: String,
     /// v2: the user's password (plaintext UTF-8). Empty in v1.
