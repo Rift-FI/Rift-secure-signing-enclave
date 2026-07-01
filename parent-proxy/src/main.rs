@@ -63,6 +63,7 @@ const DEFAULT_ENCLAVE_PORT: u32 = 5005;
 const DEFAULT_KMS_PROXY_PORT: u32 = 5006;
 const DEFAULT_GENERATE_WALLET_PORT: u32 = 5007;
 const DEFAULT_MIGRATE_PORT: u32 = 5008;
+const DEFAULT_RESEAL_PORT: u32 = 5009;
 // Public by default so Railway smart-wallet can reach us. When you
 // want to keep this proxy localhost-only (smart-wallet on the same
 // host), set HTTP_BIND=127.0.0.1:7777 in the systemd env file.
@@ -78,6 +79,10 @@ struct AppState {
     enclave_generate_wallet_port: u32,
     /// Phase 3 — separate vsock port for v1/v2 → v3 envelope migration.
     enclave_migrate_port: u32,
+    /// Phase 3 — separate vsock port for v3 envelope reseal (append or
+    /// remove an enrolled method without changing the EOA key). Own
+    /// port keeps a hung reseal from starving sign / migrate / gw.
+    enclave_reseal_port: u32,
     #[allow(dead_code)]
     kms: Arc<KmsClient>,
 }
@@ -99,6 +104,7 @@ async fn main() -> Result<()> {
         DEFAULT_GENERATE_WALLET_PORT,
     );
     let enclave_migrate_port = env_u32("ENCLAVE_MIGRATE_PORT", DEFAULT_MIGRATE_PORT);
+    let enclave_reseal_port = env_u32("ENCLAVE_RESEAL_PORT", DEFAULT_RESEAL_PORT);
     let kms_proxy_port = env_u32("KMS_PROXY_PORT", DEFAULT_KMS_PROXY_PORT);
     let http_bind = std::env::var("HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.to_string());
 
@@ -107,6 +113,7 @@ async fn main() -> Result<()> {
         enclave_port,
         enclave_generate_wallet_port,
         enclave_migrate_port,
+        enclave_reseal_port,
         kms_proxy_port,
         http_bind = %http_bind,
         "starting rift-parent-proxy"
@@ -125,6 +132,7 @@ async fn main() -> Result<()> {
         enclave_port,
         enclave_generate_wallet_port,
         enclave_migrate_port,
+        enclave_reseal_port,
         kms: kms.clone(),
     };
 
@@ -156,6 +164,10 @@ async fn main() -> Result<()> {
         .route(
             "/migrate-envelope",
             post(migrate_envelope_handler).route_layer(middleware::from_fn(bearer_auth)),
+        )
+        .route(
+            "/reseal-v3",
+            post(reseal_v3_handler).route_layer(middleware::from_fn(bearer_auth)),
         )
         .route("/health", post(health_handler))
         .route("/health", axum::routing::get(health_handler))
@@ -592,6 +604,156 @@ async fn migrate_envelope_handler(
             }
             Err(e) => {
                 error!(error = ?e, "forward to enclave (migrate-envelope) failed");
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(SignError {
+                        error: format!("forward to enclave: {e:#}"),
+                    }),
+                ))
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, body);
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SignError {
+                error: "parent proxy only runs on Linux".to_string(),
+            }),
+        ))
+    }
+}
+
+// ─── /reseal-v3 (append/remove enrolled_methods on a v3 envelope) ───
+//
+// Backend calls this to add a passkey (from a new device) or link an
+// OIDC provider to an existing v3 envelope. The consent gate is an
+// `auth_proof` produced by a method ALREADY inside the envelope —
+// the enclave's `verify_auth_proof` runs on the current methods list
+// after unwrap. Duplicate methods are rejected. Same EOA private key
+// on the way out; only the sealed methods list + wrapped DEK change.
+//
+// See enclave/src/vsock_server.rs::process_reseal_v3 for the enclave
+// side of this HTTP call.
+
+/// JSON body backend posts to POST /reseal-v3.
+#[derive(Debug, Deserialize)]
+struct ResealBody {
+    /// CMK ARN for the active mode.
+    kms_key_arn: String,
+    /// The existing v3 envelope blob (`enc:v3:...`).
+    old_envelope_blob: String,
+    /// Consent proof from a method that's currently in the envelope.
+    /// Shape mirrors `protocol::AuthProof` (Oidc or Passkey).
+    auth_proof: serde_json::Value,
+    /// The 32-byte challenge (hex) that `auth_proof` was signed
+    /// against. For passkey: `clientDataJSON.challenge` after b64url
+    /// decode. For OIDC: `id_token.nonce`. Backend generates the
+    /// challenge with a short TTL so replays are ineffective.
+    prehashed_hex: String,
+    /// The method to append to the enrolled_methods list. Enclave
+    /// refuses if this would duplicate an existing entry (by (iss, sub)
+    /// for OIDC, by cred_id for passkey).
+    new_method: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ResealSuccess {
+    envelope_blob: String,
+    owner_address: String,
+}
+
+async fn reseal_v3_handler(
+    State(state): State<AppState>,
+    Json(body): Json<ResealBody>,
+) -> Result<Json<ResealSuccess>, (StatusCode, Json<SignError>)> {
+    #[cfg(target_os = "linux")]
+    {
+        // Lightweight sanity check before we bother the enclave. Real
+        // v3 validation happens inside the enclave; this only catches
+        // the obviously-broken calls (client bug, not adversarial
+        // input we care about).
+        if !body.old_envelope_blob.starts_with("enc:v3:") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(SignError {
+                    error: "old_envelope_blob must start with enc:v3:".to_string(),
+                }),
+            ));
+        }
+        if body.prehashed_hex.trim_start_matches("0x").len() != 64 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(SignError {
+                    error: "prehashed_hex must be 32 bytes (64 hex chars)".to_string(),
+                }),
+            ));
+        }
+
+        let enclave_req = serde_json::json!({
+            "kms_key_arn": body.kms_key_arn,
+            "old_envelope_blob": body.old_envelope_blob,
+            "auth_proof": body.auth_proof,
+            "prehashed_hex": body.prehashed_hex,
+            "new_method": body.new_method,
+        });
+
+        match forward_to_enclave(
+            state.enclave_cid,
+            state.enclave_reseal_port,
+            &enclave_req,
+        )
+        .await
+        {
+            Ok(resp) => {
+                if let Some(ok) = resp.get("Ok") {
+                    let envelope_blob = ok
+                        .get("envelope_blob")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let owner_address = ok
+                        .get("owner_address")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if envelope_blob.is_empty() || owner_address.is_empty() {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            Json(SignError {
+                                error: format!("malformed enclave response: {resp}"),
+                            }),
+                        ));
+                    }
+                    Ok(Json(ResealSuccess {
+                        envelope_blob,
+                        owner_address,
+                    }))
+                } else if let Some(err) = resp
+                    .get("Err")
+                    .and_then(|e| e.get("reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    warn!(reason = %err, "enclave reseal-v3 returned error");
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(SignError {
+                            error: format!("enclave: {err}"),
+                        }),
+                    ))
+                } else {
+                    Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(SignError {
+                            error: format!("malformed enclave response: {resp}"),
+                        }),
+                    ))
+                }
+            }
+            Err(e) => {
+                error!(error = ?e, "forward to enclave (reseal-v3) failed");
                 Err((
                     StatusCode::BAD_GATEWAY,
                     Json(SignError {

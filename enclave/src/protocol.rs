@@ -285,3 +285,66 @@ pub enum KmsGenerateDataKeyResponse {
         reason: String,
     },
 }
+
+/// Parent → Enclave: rewrap an existing v3 envelope with a new set of
+/// enrolled methods. Used to ADD a passkey (from another device) or
+/// LINK an OIDC provider (Google / Apple) to a wallet that already
+/// exists on v3.
+///
+/// Pipeline (mirrors migrate + sign):
+///   1. Parse `old_envelope_blob` — must be v3.
+///   2. KMS-Decrypt the old wrapped DEK (Recipient-attested).
+///   3. AES-GCM-decrypt the inner CBOR payload → EOA priv + existing
+///      auth_methods.
+///   4. Verify `auth_proof` against the CURRENT methods with
+///      `prehashed_hex` as the expected challenge / nonce. This is
+///      the consent signal — only a user who can already sign for
+///      this wallet may add a new method.
+///   5. Refuse if `new_method` is a duplicate of an existing entry.
+///   6. KMS-GenerateDataKey → fresh DEK.
+///   7. AES-GCM-seal `(priv, existing_methods + [new_method])` under
+///      the new DEK.
+///   8. Return the new blob + owner address (unchanged; the EOA key
+///      never rotates).
+///
+/// The KMS attestation gate on both Decrypt (step 2) and
+/// GenerateDataKey (step 6) means a compromised parent CANNOT alter
+/// the method list even if it were to intercept the wire — the
+/// attestation doc identifies the enclave binary, and the reseal
+/// operation is only exposed by THIS enclave's protocol.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResealV3Request {
+    pub kms_key_arn: String,
+    /// The current v3 envelope blob. Must start with `enc:v3:`.
+    pub old_envelope_blob: String,
+    /// Consent proof produced by a method that's ALREADY inside the
+    /// envelope. The enclave verifies the proof after unwrapping so
+    /// that the exact same "must match an enrolled method" check as
+    /// on the sign path applies here too.
+    pub auth_proof: AuthProof,
+    /// The 32-byte challenge (hex) that `auth_proof` was signed
+    /// against. For passkey proofs this is compared to
+    /// `clientDataJSON.challenge`; for OIDC proofs it's compared to
+    /// the `nonce` claim of the id_token. Backend-generated + one
+    /// shot; TTL is enforced upstream (this enclave has no clock
+    /// beyond the attestation timestamp).
+    pub prehashed_hex: String,
+    /// The new method to append to the enrolled_methods list.
+    pub new_method: EnrolledMethod,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ResealV3Response {
+    Ok {
+        /// The reshaped `enc:v3:...` blob. Same EOA key, new DEK,
+        /// enrolled_methods.len() + 1 methods.
+        envelope_blob: String,
+        /// EOA address derived from the (unchanged) private key —
+        /// backend uses this to sanity-check that the reseal didn't
+        /// silently rotate keys.
+        owner_address: String,
+    },
+    Err {
+        reason: String,
+    },
+}

@@ -42,19 +42,21 @@ use crate::{
         AuthProof, EnrolledMethod, GenerateWalletRequest, GenerateWalletResponse,
         KmsDecryptRequest, KmsDecryptResponse, KmsGenerateDataKeyRequest,
         KmsGenerateDataKeyResponse, MigrateEnvelopeRequest, MigrateEnvelopeResponse,
-        SignRequest, SignResponse,
+        ResealV3Request, ResealV3Response, SignRequest, SignResponse,
     },
+    reseal_helpers::{enrolled_to_authmethod, is_duplicate_method},
     signing, webauthn_verification,
 };
 
-/// Serves three concurrent vsock listeners — sign (5005),
-/// generate-wallet (5007), and migrate-envelope (5008). Each is an
-/// independent tokio task so a hung listener of one kind cannot
-/// starve the others.
+/// Serves four concurrent vsock listeners — sign (5005),
+/// generate-wallet (5007), migrate-envelope (5008), and reseal-v3
+/// (5009). Each is an independent tokio task so a hung listener of one
+/// kind cannot starve the others.
 pub async fn serve(
     vsock_port: u32,
     generate_wallet_port: u32,
     migrate_port: u32,
+    reseal_port: u32,
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<()> {
@@ -68,6 +70,11 @@ pub async fn serve(
         parent_cid,
         parent_kms_proxy_port,
     ));
+    let reseal_handle = tokio::spawn(serve_reseal(
+        reseal_port,
+        parent_cid,
+        parent_kms_proxy_port,
+    ));
 
     let sign_result = serve_sign(vsock_port, parent_cid, parent_kms_proxy_port).await;
     // Best-effort: if the sign loop exits, abort the others too so the
@@ -75,6 +82,7 @@ pub async fn serve(
     // partially-up enclave.
     gw_handle.abort();
     mig_handle.abort();
+    reseal_handle.abort();
     sign_result
 }
 
@@ -1034,6 +1042,244 @@ async fn process_migrate(
 
     info!(owner_address = %owner_address, "envelope migrated to v3 inside enclave");
     Ok((new_blob, owner_address))
+}
+
+// ─── v3 reseal pipeline ─────────────────────────────────────────────
+//
+// Adds a new AuthMethod to an already-v3 envelope. Same crypto shape
+// as migrate — KMS-Decrypt old DEK, unwrap, verify consent, KMS-
+// GenerateDataKey new DEK, seal — but the input side is different:
+//   1. Input is v3 (not v1/v2), so we go straight through envelope_v3.
+//   2. Consent is `auth_proof` against an already-enrolled method,
+//      NOT a v2 password. This is the difference that lets a user who
+//      already has (say) Google enrol a passkey for a second device.
+//   3. Duplicate check: refuse to append a method that would collide
+//      with an existing one (same cred_id, or same iss+sub). Silent
+//      appends would inflate the methods list without adding real
+//      recovery.
+
+async fn serve_reseal(
+    port: u32,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    let addr = VsockAddr::new(u32::MAX, port);
+    let mut listener = VsockListener::bind(addr)
+        .context("vsock bind failed (reseal)")?;
+    info!(port = port, "listening for reseal-v3 requests on vsock");
+
+    let mut conn_counter: u64 = 0;
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("vsock accept failed (reseal)")?;
+        conn_counter += 1;
+        let cid = conn_counter;
+        let span = info_span!("reseal-conn", id = cid, peer_cid = peer.cid());
+        tokio::spawn(
+            async move {
+                if let Err(e) =
+                    handle_one_reseal(stream, parent_cid, parent_kms_proxy_port).await
+                {
+                    warn!(error = ?e, "reseal handler aborted");
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+async fn handle_one_reseal(
+    mut stream: VsockStream,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<()> {
+    let request = read_frame::<ResealV3Request>(&mut stream).await?;
+    info!(
+        kms_key_arn = %request.kms_key_arn,
+        auth_proof_kind = auth_proof_kind_str(&request.auth_proof),
+        new_method_kind = enrolled_method_kind_str(&request.new_method),
+        "reseal-v3 request received"
+    );
+
+    let response = match process_reseal_v3(request, parent_cid, parent_kms_proxy_port).await {
+        Ok((envelope_blob, owner_address)) => ResealV3Response::Ok {
+            envelope_blob,
+            owner_address,
+        },
+        Err(e) => {
+            error!(error = ?e, "reseal-v3 failed");
+            ResealV3Response::Err {
+                reason: format!("{e:#}"),
+            }
+        }
+    };
+    write_frame(&mut stream, &response).await?;
+    Ok(())
+}
+
+async fn process_reseal_v3(
+    req: ResealV3Request,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<(String, String)> {
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+
+    // ── 1. Parse the old v3 envelope ─────────────────────────────────
+    let env = envelope_v3::EnvelopeV3::parse(&req.old_envelope_blob)
+        .context("parse old v3 envelope blob")?;
+    let wrapped_dek_b64 = B64.encode(&env.wrapped_dek);
+
+    // ── 2. KMS-Decrypt the OLD DEK (Recipient-attested) ───────────────
+    let (mut old_dek, attestation_ts) = kms_decrypt_dek(
+        parent_cid,
+        parent_kms_proxy_port,
+        &wrapped_dek_b64,
+        &req.kms_key_arn,
+    )
+    .await?;
+    if old_dek.len() != 32 {
+        old_dek.zeroize();
+        bail!(
+            "old wrapped DEK has unexpected length {} (want 32)",
+            old_dek.len()
+        );
+    }
+    let mut old_dek_arr = [0u8; 32];
+    old_dek_arr.copy_from_slice(&old_dek[..]);
+    old_dek.zeroize();
+
+    // ── 3. Open the envelope → (priv_key, existing_methods) ──────────
+    let (priv_key, existing_methods) = envelope_v3::open(&env, &old_dek_arr)?;
+    old_dek_arr.zeroize();
+    if existing_methods.is_empty() {
+        bail!("existing envelope has no enrolled methods — reseal would corrupt the wallet");
+    }
+
+    // ── 4. Parse challenge (prehashed_hex) ───────────────────────────
+    let hash_clean = req.prehashed_hex.trim_start_matches("0x");
+    let hash_bytes = hex::decode(hash_clean).context("hex-decode challenge")?;
+    if hash_bytes.len() != 32 {
+        bail!(
+            "challenge (prehashed_hex) must be 32 bytes, got {}",
+            hash_bytes.len()
+        );
+    }
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&hash_bytes);
+
+    // ── 5. Verify consent proof against EXISTING methods ─────────────
+    // Same `verify_auth_proof` used on the sign path. Only a user who
+    // could already sign for this wallet can add or remove methods.
+    verify_auth_proof(
+        &req.auth_proof,
+        &existing_methods,
+        &hash_arr,
+        attestation_ts,
+    )
+    .context("reseal-v3 auth_proof verification failed")?;
+
+    // ── 6. Convert new_method + duplicate check ──────────────────────
+    let new_method = enrolled_to_authmethod(&req.new_method)?;
+    if is_duplicate_method(&existing_methods, &new_method) {
+        bail!("new_method is already enrolled — refusing to append a duplicate");
+    }
+
+    // ── 7. Derive owner address (sanity — never changes) ────────────
+    let signing_key = SigningKey::from_bytes((&priv_key[..]).into())
+        .map_err(|e| anyhow!("recovered priv key rejected by k256: {e}"))?;
+    let pubkey = signing_key.verifying_key();
+    let uncompressed = pubkey.to_encoded_point(false);
+    let xy = &uncompressed.as_bytes()[1..];
+    let hash = Keccak256::digest(xy);
+    let addr_bytes = &hash[12..];
+    let owner_address = format!("0x{}", hex::encode(addr_bytes));
+
+    // ── 8. KMS-GenerateDataKey → fresh DEK ───────────────────────────
+    let mut rng = rand::rngs::OsRng;
+    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
+        .context("RSA-2048 keygen for reseal KMS-recipient channel")?;
+    let rsa_pub = RsaPublicKey::from(&rsa_priv);
+    let rsa_pub_der = rsa_pub
+        .to_public_key_der()
+        .context("encode RSA pubkey")?
+        .to_vec();
+    let mut nonce_buf = [0u8; 32];
+    rng.fill_bytes(&mut nonce_buf);
+    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce_buf)
+        .context("NSM attestation for reseal")?;
+    let kms_req = KmsGenerateDataKeyRequest {
+        attestation_doc_b64: B64.encode(&*attestation_doc),
+        kms_key_arn: req.kms_key_arn.clone(),
+    };
+    let kms_resp =
+        kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
+            .await
+            .context("parent KMS GenerateDataKey round trip (reseal)")?;
+    let (new_wrapped_dek_b64, cfr_b64) = match kms_resp {
+        KmsGenerateDataKeyResponse::Ok {
+            ciphertext_blob_b64,
+            ciphertext_for_recipient_b64,
+        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
+        KmsGenerateDataKeyResponse::Err { reason } => {
+            bail!("parent KMS GenerateDataKey returned error: {reason}");
+        }
+    };
+    let cfr = B64
+        .decode(&cfr_b64)
+        .context("base64-decode CiphertextForRecipient")?;
+    let mut new_dek = cms_unwrap_data_key(&rsa_priv, &cfr)
+        .context("CMS unwrap of CiphertextForRecipient")?;
+    if new_dek.len() != 32 {
+        new_dek.zeroize();
+        bail!("new DEK length {} (want 32)", new_dek.len());
+    }
+    let mut new_dek_arr = [0u8; 32];
+    new_dek_arr.copy_from_slice(&new_dek[..]);
+    new_dek.zeroize();
+
+    // ── 9. Append + seal fresh v3 envelope ───────────────────────────
+    let mut merged_methods = existing_methods;
+    merged_methods.push(new_method);
+
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(&priv_key[..]);
+    // `priv_key` (Zeroizing) drops at fn end — no explicit clear.
+
+    let mut new_nonce = [0u8; password_derivation::GCM_NONCE_LEN];
+    rng.fill_bytes(&mut new_nonce);
+
+    let new_blob = envelope_v3::seal(
+        &sk_arr,
+        merged_methods,
+        &new_dek_arr,
+        &new_nonce,
+        &new_wrapped_dek_b64,
+    )?;
+    sk_arr.zeroize();
+    new_dek_arr.zeroize();
+
+    info!(
+        owner_address = %owner_address,
+        "v3 envelope resealed with new auth method appended"
+    );
+    Ok((new_blob, owner_address))
+}
+
+fn auth_proof_kind_str(p: &AuthProof) -> &'static str {
+    match p {
+        AuthProof::Oidc { .. } => "oidc",
+        AuthProof::Passkey { .. } => "passkey",
+    }
+}
+
+fn enrolled_method_kind_str(m: &EnrolledMethod) -> &'static str {
+    match m {
+        EnrolledMethod::Oidc { .. } => "oidc",
+        EnrolledMethod::Passkey { .. } => "passkey",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
