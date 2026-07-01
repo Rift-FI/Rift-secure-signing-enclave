@@ -83,6 +83,11 @@ impl WebAuthnPolicy {
                 // Non-custodial sandbox — wallet + widget domains.
                 "https://wallet.sandbox.riftfi.com",
                 "https://widget.sandbox.riftfi.com",
+                // Prod wallet hosts (pre-added so the sandbox → prod
+                // promotion doesn't need another EIF rebuild + KMS
+                // reattestation cycle just for origin plumbing).
+                "https://wallet.riftfi.com",
+                "https://wallet.riftfi.xyz",
                 // Legacy sandbox landing hosts.
                 "https://sandbox.riftfi.xyz",
                 "https://sandbox.riftfi.com",
