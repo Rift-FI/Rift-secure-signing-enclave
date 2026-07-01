@@ -62,10 +62,16 @@ pub struct WebAuthnPolicy {
 }
 
 impl WebAuthnPolicy {
-    /// Sandbox policy. Three RP-IDs cover the .xyz + .com subdomains
-    /// + localhost for dev. Origins cover http://localhost:3000 and
-    /// both sandbox subdomains. Update + rebuild EIF when domains
-    /// change.
+    /// Sandbox policy. RP-IDs cover the .xyz + .com eTLD+1s + localhost
+    /// for dev; origins enumerate every deployed frontend host we
+    /// actually receive WebAuthn assertions from. Update + rebuild EIF
+    /// when domains change — this list is compiled into the enclave
+    /// image, no runtime override.
+    ///
+    /// Passkey assertions from any origin NOT in this list are rejected
+    /// with "origin ... not in the pinned accept list" — a common cause
+    /// of "consent factor missing/wrong" after a new frontend hostname
+    /// is provisioned. If you see that, add the host here and rebuild.
     pub fn default_prod() -> Self {
         Self {
             accepted_rp_ids: &[
@@ -74,8 +80,15 @@ impl WebAuthnPolicy {
                 "localhost",
             ],
             accepted_origins: &[
+                // Non-custodial sandbox — wallet + widget domains.
+                "https://wallet.sandbox.riftfi.com",
+                "https://widget.sandbox.riftfi.com",
+                // Legacy sandbox landing hosts.
                 "https://sandbox.riftfi.xyz",
                 "https://sandbox.riftfi.com",
+                // Prod-shape hostnames (referenced by tests / older
+                // deployments — keep to avoid regressions once the
+                // v3 sandbox promotes to prod).
                 "https://app.riftfi.xyz",
                 "https://app.riftfi.com",
                 "https://dashboard.riftfi.xyz",
