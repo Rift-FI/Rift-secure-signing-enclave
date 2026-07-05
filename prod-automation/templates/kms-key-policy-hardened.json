@@ -1,0 +1,37 @@
+{
+  "Version": "2012-10-17",
+  "Id": "rift-signer-enclave-hardened",
+  "Statement": [
+    {
+      "Sid": "EnableRootAdmin",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT_ID__:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowAttestedDecryptFromSignerEnclave",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT_ID__:role/__ROLE_NAME__" },
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:ImageSha384": "__PCR0__"
+        }
+      }
+    },
+    {
+      "Sid": "DenyDecryptWithoutAttestation",
+      "Effect": "Deny",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT_ID__:role/__ROLE_NAME__" },
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "kms:RecipientAttestation:ImageSha384": "true"
+        }
+      }
+    }
+  ]
+}

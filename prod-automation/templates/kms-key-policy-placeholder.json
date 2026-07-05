@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Id": "rift-signer-enclave-placeholder",
+  "Statement": [
+    {
+      "Sid": "EnableRootAdmin",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT_ID__:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowRoleDecryptWithoutAttestationYet",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT_ID__:role/__ROLE_NAME__" },
+      "Action": ["kms:Decrypt", "kms:DescribeKey"],
+      "Resource": "*"
+    }
+  ]
+}
