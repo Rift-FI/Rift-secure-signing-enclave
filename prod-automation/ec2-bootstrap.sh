@@ -57,7 +57,7 @@ sudo dnf install -y \
   git jq curl tar make gcc gcc-c++ pkgconf-pkg-config \
   openssl openssl-devel \
   aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel \
-  docker
+  docker nginx
 
 step "2 · docker + user groups"
 sudo systemctl enable --now docker
@@ -132,7 +132,88 @@ step "8 · install parent-proxy as systemd unit"
 make install-parent-proxy
 sudo systemctl status rift-parent-proxy --no-pager | head -6 || true
 
-step "9 · save state for the runbook"
+step "9 · nginx sidecar (public /sign + /generate-wallet with bearer auth)"
+# The enclave's parent-proxy listens on 127.0.0.1:7777 unauthenticated.
+# Rift's centralized smart-wallet needs to reach this over the public
+# internet. nginx terminates the ALB's plaintext hop on :8080 (behind an
+# ALB + ACM cert), verifies the Authorization: Bearer <token> header
+# against a shared secret set in /etc/rift-nginx-bearer, and forwards
+# to 127.0.0.1:7777. Anything without the correct bearer gets a 401.
+#
+# The bearer is a random 64-hex string you (the integrator) generate
+# once and share with Rift on registration. Rotate by regenerating and
+# updating both sides.
+
+# Generate a bearer if one doesn't exist yet. Idempotent.
+if [[ ! -f /etc/rift-nginx-bearer ]]; then
+  BEARER=$(openssl rand -hex 32)
+  sudo tee /etc/rift-nginx-bearer >/dev/null <<< "$BEARER"
+  sudo chmod 600 /etc/rift-nginx-bearer
+  log "generated fresh bearer at /etc/rift-nginx-bearer"
+else
+  BEARER=$(sudo cat /etc/rift-nginx-bearer)
+  log "reusing existing bearer from /etc/rift-nginx-bearer"
+fi
+
+sudo tee /etc/nginx/conf.d/rift-parent-proxy.conf >/dev/null <<NGINX
+# Rift parent-proxy public exposure. Listens on :8080 behind the ALB,
+# validates Bearer, forwards to the local parent-proxy on :7777.
+#
+# ALB terminates TLS; this listener is HTTP because it only ever hears
+# from the ALB in the same VPC.
+
+map \$http_authorization \$rift_authorized {
+    default 0;
+    "Bearer $BEARER" 1;
+}
+
+server {
+    listen 8080;
+    server_name _;
+
+    # Reject anything that isn't the exact Bearer we set.
+    if (\$rift_authorized = 0) {
+        return 401;
+    }
+
+    # Only forward the two public methods. /health stays open (needed
+    # for ALB health checks). Everything else is refused.
+    location = /health {
+        proxy_pass http://127.0.0.1:7777/health;
+        proxy_set_header Host \$host;
+    }
+    location = /sign {
+        proxy_pass http://127.0.0.1:7777/sign;
+        proxy_set_header Host \$host;
+        proxy_read_timeout 35s;
+    }
+    location = /generate-wallet {
+        proxy_pass http://127.0.0.1:7777/generate-wallet;
+        proxy_set_header Host \$host;
+        proxy_read_timeout 35s;
+    }
+    location / { return 404; }
+}
+
+# Health-only server on :8081 — ALB probes this WITHOUT a bearer.
+# Keep it distinct from the auth'd surface so a busted ALB check
+# can't be used as an oracle for whether the auth is up.
+server {
+    listen 8081;
+    server_name _;
+    location = /health {
+        proxy_pass http://127.0.0.1:7777/health;
+    }
+    location / { return 404; }
+}
+NGINX
+
+sudo nginx -t || die "nginx config test failed"
+sudo systemctl enable --now nginx
+sudo systemctl restart nginx
+sudo systemctl status nginx --no-pager | head -4 || true
+
+step "10 · save state for the runbook"
 STATE="$WORKROOT/state.json"
 INSTANCE_ID=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/instance-id || echo unknown)
 REGION=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/placement/region || echo unknown)
@@ -145,6 +226,7 @@ cat > "$STATE" <<JSON
   "enclave_ref": "$ENCLAVE_REF",
   "enclave_sha": "$BUILT_SHA",
   "pcr0": "$PCR0",
+  "bearer_file": "/etc/rift-nginx-bearer",
   "enclave_cpus": $ENCLAVE_CPUS,
   "enclave_memory_mib": $ENCLAVE_MEMORY_MIB,
   "captured_at": "$(date -u +%FT%TZ)"
@@ -161,17 +243,23 @@ echo "  instance    : $INSTANCE_ID  ($REGION)"
 echo "  ref         : $ENCLAVE_REF"
 echo "  built sha   : $BUILT_SHA"
 echo "  PCR0        : $PCR0"
+echo "  bearer file : /etc/rift-nginx-bearer  (600, root)"
 echo
 echo "▶ VERIFY the PCR0 matches Rift's canonical published value"
 echo "  before pinning it into your KMS policy:"
 echo
-echo "    ENCLAVE_REF=$ENCLAVE_REF PCR0=$PCR0 ./verify-pcr0.sh"
+echo "    ./verify-pcr0.sh"
 echo
 echo "▶ NEXT MANUAL STEPS (see INTEGRATOR-SETUP.md):"
 echo "  1. verify PCR0 (above)"
 echo "  2. paste PCR0 into your KMS key policy's"
 echo "     kms:RecipientAttestation:ImageSha384 condition"
-echo "  3. cd ~/rift/Rift-secure-signing-enclave && sudo make run-debug"
-echo "  4. curl http://127.0.0.1:7777/health"
-echo "  5. run smart-wallet-bootstrap.sh once step 4 is green"
+echo "  3. cd ~/rift/Rift-secure-signing-enclave && sudo make run"
+echo "  4. curl http://127.0.0.1:8081/health   # ALB health path"
+echo "  5. put your bearer + parent-proxy URL + KMS ARN into Rift's"
+echo "     admin API. Then Rift routes your projects' users to your"
+echo "     enclave automatically. See INTEGRATOR-SETUP.md step 9."
+echo
+echo "  Bearer to share with Rift on registration:"
+echo "    sudo cat /etc/rift-nginx-bearer"
 echo
