@@ -62,11 +62,13 @@ eif: image
 	  --output-file $(EIF)
 
 .PHONY: pcr0
+# Extract PCR0 (the enclave measurement) from `nitro-cli describe-eif`.
+# Uses jq because grep -A1 grabbed PCR0's line AND the next line (PCR1),
+# then tail -1 picked PCR1, producing garbage that failed the 96-char
+# length check in ec2-bootstrap.sh step 9. jq is already installed by
+# the bootstrap's dnf step, so no new dependency.
 pcr0:
-	@sudo nitro-cli describe-eif --eif-path $(EIF) \
-	  | grep -A1 '"PCR0"' \
-	  | tail -1 \
-	  | tr -d ' ",'
+	@sudo nitro-cli describe-eif --eif-path $(EIF) | jq -r '.Measurements.PCR0'
 
 .PHONY: run-debug
 run-debug: eif
