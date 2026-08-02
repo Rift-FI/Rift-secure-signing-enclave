@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-ENCLAVE_SRC="${ENCLAVE_SRC:-$HOME/rift/Rift-secure-signing-enclave}"
+ENCLAVE_SRC="${ENCLAVE_SRC:-${HOME:-/home/ec2-user}/rift/Rift-secure-signing-enclave}"
 JWKS_SNIPPET="/tmp/jwks-snippet-$(date +%s).rs"
 BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
 
