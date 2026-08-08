@@ -29,6 +29,7 @@ mod envelope_v3;
 mod oidc_verification;
 mod password_derivation;
 mod pinned_jwks;
+mod project_config;
 mod protocol;
 mod reseal_helpers;
 mod signing;

@@ -21,6 +21,10 @@ hkdf.workspace = true
 k256.workspace = true
 p256.workspace = true
 rsa.workspace = true
+# Ed25519 verifier for per-project WebAuthn accept-list config.
+# Signing key lives outside the enclave (Rift backend); this crate
+# only VERIFIES, so no private-key material ships in the EIF.
+ed25519-dalek.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 rand.workspace = true
