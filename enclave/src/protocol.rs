@@ -85,6 +85,37 @@ pub struct SignRequest {
     /// assertion challenged with this transaction's hash.
     #[serde(default)]
     pub auth_proof: Option<AuthProof>,
+
+    // ─── Per-project WebAuthn accept-list config (optional) ─────────
+    //
+    // v3 / passkey path only. The parent-proxy MAY include a
+    // Rift-signed bundle telling the enclave "for this project, accept
+    // these RP-IDs and origins in addition to (or in place of) the
+    // hardcoded defaults". Verified against the ed25519 public key
+    // baked into `project_config::RIFT_PROJECT_CONFIG_SIGNING_PUBKEY`.
+    //
+    // Backward compat: absent + all other clients keep working.
+    // Verification failure: falls back to hardcoded default policy
+    // (see project_config::resolve_policy). NEVER causes a hard error
+    // that would take down signing — a broken deploy of this feature
+    // just disables per-project overrides.
+    /// Rift-project-id the sign request is scoped to. Required when
+    /// signed_config_json is present (used for project_id binding
+    /// check in project_config::verify_and_parse).
+    #[serde(default)]
+    pub project_id: Option<String>,
+
+    /// Canonical JSON of the signed config — see
+    /// project_config::SignedProjectConfig for the shape.
+    /// Pass-through bytes; the enclave verifies the signature over
+    /// SHA256 of these exact bytes without re-canonicalising.
+    #[serde(default)]
+    pub signed_config_json: Option<String>,
+
+    /// Ed25519 signature (STANDARD base64) over sha256(signed_config_json)
+    /// under `project_config::RIFT_PROJECT_CONFIG_SIGNING_PUBKEY`.
+    #[serde(default)]
+    pub signed_config_signature_b64: Option<String>,
 }
 
 /// Tagged union of consent proofs accepted by v3 envelopes. The

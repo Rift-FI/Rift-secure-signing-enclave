@@ -48,17 +48,48 @@ use sha2::{Digest, Sha256};
 pub struct WebAuthnPolicy {
     /// Allowed RP-IDs. Typically the eTLD+1 of each app origin.
     /// Examples: "riftfi.xyz", "riftfi.com", "localhost".
-    pub accepted_rp_ids: &'static [&'static str],
+    ///
+    /// Storage indirection (`Cow`) so we can carry EITHER the
+    /// compiled-in `&'static [&'static str]` (default_prod path,
+    /// zero allocation) OR a runtime-owned `Vec<String>` from a
+    /// signed per-project config (see `project_config.rs`). Verify
+    /// code just iterates &str either way.
+    pub accepted_rp_ids: RpList,
 
     /// Allowed origins from clientDataJSON. Must include every origin
     /// the frontend SDK might call `navigator.credentials.get()` from.
-    pub accepted_origins: &'static [&'static str],
+    /// Same Cow trick as `accepted_rp_ids`.
+    pub accepted_origins: RpList,
 
     /// If true, also require the UV (user verified) flag — meaning the
     /// authenticator confirmed presence + identity (biometric or PIN),
     /// not just touch. Most modern platforms always set UV; setting
     /// this to true gives a stronger guarantee.
     pub require_user_verified: bool,
+}
+
+/// Either a compile-time slice (default policy path) or an
+/// owned Vec built from a signed per-project config. The verify
+/// code just needs to iterate `&str`, so we abstract the source.
+///
+/// Not using `std::borrow::Cow<'static, [&'static str]>` because
+/// that would require the runtime path to also carry `&'static str`
+/// references, which we don't have from a runtime-parsed JSON.
+/// This concrete two-variant enum is smaller + clearer.
+pub enum RpList {
+    Static(&'static [&'static str]),
+    Owned(Vec<String>),
+}
+
+impl RpList {
+    /// Iterate the list as `&str` regardless of storage. Verify
+    /// code uses this to match rp_ids / origins.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            RpList::Static(s) => Box::new(s.iter().copied()),
+            RpList::Owned(v) => Box::new(v.iter().map(|s| s.as_str())),
+        }
+    }
 }
 
 impl WebAuthnPolicy {
@@ -74,12 +105,12 @@ impl WebAuthnPolicy {
     /// is provisioned. If you see that, add the host here and rebuild.
     pub fn default_prod() -> Self {
         Self {
-            accepted_rp_ids: &[
+            accepted_rp_ids: RpList::Static(&[
                 "riftfi.xyz",
                 "riftfi.com",
                 "localhost",
-            ],
-            accepted_origins: &[
+            ]),
+            accepted_origins: RpList::Static(&[
                 // Non-custodial sandbox — wallet + widget domains.
                 "https://wallet.sandbox.riftfi.com",
                 "https://widget.sandbox.riftfi.com",
@@ -98,8 +129,48 @@ impl WebAuthnPolicy {
                 "https://app.riftfi.com",
                 "https://dashboard.riftfi.xyz",
                 "http://localhost:3000",
-            ],
+            ]),
             require_user_verified: true,
+        }
+    }
+
+    /// Build a policy from runtime-owned string lists — used by
+    /// `project_config::resolve_policy` when the caller provides a
+    /// signed per-project accept-list bundle.
+    ///
+    /// Empty lists are permitted here (constructor doesn't validate);
+    /// verification-time checks will fail closed if any list is empty
+    /// (rp_id / origin match against an empty list returns false).
+    /// Upstream (`project_config`) already rejects empty lists before
+    /// reaching this constructor, so this path just wraps.
+    pub fn from_owned(
+        accepted_rp_ids: Vec<String>,
+        accepted_origins: Vec<String>,
+        require_user_verified: bool,
+    ) -> Self {
+        Self {
+            accepted_rp_ids: RpList::Owned(accepted_rp_ids),
+            accepted_origins: RpList::Owned(accepted_origins),
+            require_user_verified,
+        }
+    }
+
+    /// Test-only helper: extract the owned lists for round-trip
+    /// assertions. Returns None if this policy is a Static (default)
+    /// variant.
+    #[cfg(test)]
+    pub fn owned_origins(&self) -> Option<&[String]> {
+        match &self.accepted_origins {
+            RpList::Owned(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn owned_rp_ids(&self) -> Option<&[String]> {
+        match &self.accepted_rp_ids {
+            RpList::Owned(v) => Some(v.as_slice()),
+            _ => None,
         }
     }
 }
@@ -224,7 +295,9 @@ pub fn verify_assertion(
         );
     }
 
-    if !policy.accepted_origins.iter().any(|o| o == &cd.origin) {
+    // RpList::iter() gives us &str regardless of Static vs Owned
+    // storage. cd.origin is a String owned by the parsed ClientData.
+    if !policy.accepted_origins.iter().any(|o| o == cd.origin.as_str()) {
         bail!("origin {} is not in the pinned accept list", cd.origin);
     }
 
@@ -248,6 +321,8 @@ pub fn verify_assertion(
         let h = Sha256::digest(rp.as_bytes());
         rp_id_hash == h.as_slice()
     });
+    // (RpList::iter yields &str for both Static + Owned variants,
+    // so `rp` is &str above and `.as_bytes()` works uniformly.)
     if !matched_rp {
         bail!("rpIdHash mismatch — assertion was signed for a different RP");
     }
@@ -297,8 +372,8 @@ mod tests {
 
     fn test_policy() -> WebAuthnPolicy {
         WebAuthnPolicy {
-            accepted_rp_ids: &["test.riftfi.xyz"],
-            accepted_origins: &["https://test.riftfi.xyz"],
+            accepted_rp_ids: RpList::Static(&["test.riftfi.xyz"]),
+            accepted_origins: RpList::Static(&["https://test.riftfi.xyz"]),
             require_user_verified: true,
         }
     }
@@ -482,12 +557,12 @@ mod tests {
         // Policy accepts both .xyz and .com — assertion signed for .com
         // must verify.
         let policy = WebAuthnPolicy {
-            accepted_rp_ids: &["riftfi.xyz", "riftfi.com", "localhost"],
-            accepted_origins: &[
+            accepted_rp_ids: RpList::Static(&["riftfi.xyz", "riftfi.com", "localhost"]),
+            accepted_origins: RpList::Static(&[
                 "https://sandbox.riftfi.xyz",
                 "https://sandbox.riftfi.com",
                 "http://localhost:3000",
-            ],
+            ]),
             require_user_verified: true,
         };
 

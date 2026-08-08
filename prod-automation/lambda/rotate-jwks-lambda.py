@@ -162,10 +162,19 @@ def handler(event, context):
     started = time.time()
     try:
         # ── 1. rebuild EIF on EC2, capture new PCR0 ──
+        # SSM Run Command runs with a stripped env (HOME is unset) so we
+        # export what rotate-jwks.sh and the makefile expect. ENCLAVE_SRC
+        # explicitly wins over the $HOME-derived default inside the
+        # script. PATH is set so nitro-cli / docker / node / jq resolve
+        # even without a login shell.
         log.info("step 1: rotate-jwks.sh")
         stdout, _stderr = ssm_run(
             [
-                f"cd {ENCLAVE_DIR}/prod-automation && ./rotate-jwks.sh"
+                f"export HOME=/home/ec2-user "
+                f"&& export ENCLAVE_SRC={ENCLAVE_DIR} "
+                f"&& export PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
+                f"&& cd {ENCLAVE_DIR}/prod-automation "
+                f"&& ./rotate-jwks.sh"
             ],
             timeout=900,
         )

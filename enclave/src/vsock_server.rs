@@ -38,6 +38,7 @@ use zeroize::Zeroize;
 
 use crate::{
     attestation, envelope, envelope_v3, oidc_verification, password_derivation, pinned_jwks,
+    project_config,
     protocol::{
         AuthProof, EnrolledMethod, GenerateWalletRequest, GenerateWalletResponse,
         KmsDecryptRequest, KmsDecryptResponse, KmsGenerateDataKeyRequest,
@@ -179,7 +180,18 @@ async fn process(
     // parse it inline and ignore the v1/v2 fields entirely. This is
     // the device-bound, no-password path used by Passkey / OIDC users.
     if let Some(blob) = req.v3_envelope_blob.as_ref() {
-        return process_v3(req.user_op_hash_hex.clone(), blob.clone(), req.auth_proof.clone(), req.kms_key_arn.clone(), parent_cid, parent_kms_proxy_port).await;
+        return process_v3(
+            req.user_op_hash_hex.clone(),
+            blob.clone(),
+            req.auth_proof.clone(),
+            req.kms_key_arn.clone(),
+            req.project_id.clone(),
+            req.signed_config_json.clone(),
+            req.signed_config_signature_b64.clone(),
+            parent_cid,
+            parent_kms_proxy_port,
+        )
+        .await;
     }
 
     // ─── 1. Ephemeral RSA-2048 keypair ───────────────────────────────
@@ -362,6 +374,9 @@ async fn process_v3(
     v3_blob: String,
     auth_proof: Option<AuthProof>,
     kms_key_arn: String,
+    project_id: Option<String>,
+    signed_config_json: Option<String>,
+    signed_config_signature_b64: Option<String>,
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<String> {
@@ -405,9 +420,28 @@ async fn process_v3(
     let mut hash_arr = [0u8; 32];
     hash_arr.copy_from_slice(&user_op_hash_bytes);
 
+    // Resolve the WebAuthn accept-list policy for this request. If
+    // the parent-proxy passed a Rift-signed per-project bundle AND
+    // it verifies AND matches the request's project_id AND isn't
+    // stale, use those accept lists. Otherwise fall through to the
+    // hardcoded default (Rift's own hosts). Never hard-errors —
+    // a broken bundle silently degrades to default, so a bad deploy
+    // of this feature can't take down Rift's own signing.
+    let per_project_policy = match (
+        signed_config_json.as_deref(),
+        signed_config_signature_b64.as_deref(),
+        project_id.as_deref(),
+    ) {
+        (Some(json), Some(sig), Some(pid)) => {
+            project_config::resolve_policy(json.as_bytes(), sig, attestation_ts, pid)
+                .unwrap_or(None)
+        }
+        _ => None,
+    };
+
     // Verify the auth_proof against one of the enrolled methods. We
     // pick the matching method by `kind`; if none verifies we refuse.
-    verify_auth_proof(&proof, &methods, &hash_arr, attestation_ts)
+    verify_auth_proof(&proof, &methods, &hash_arr, attestation_ts, per_project_policy.as_ref())
         .context("v3 auth_proof verification failed")?;
 
     // Sign.
@@ -426,6 +460,7 @@ fn verify_auth_proof(
     methods: &[envelope_v3::AuthMethod],
     user_op_hash: &[u8; 32],
     now_unix_secs: i64,
+    per_project_policy: Option<&webauthn_verification::WebAuthnPolicy>,
 ) -> Result<()> {
     match proof {
         AuthProof::Oidc { id_token } => {
@@ -482,14 +517,19 @@ fn verify_auth_proof(
                 .ok_or_else(|| anyhow!("no enrolled passkey matches the assertion's cred_id"))?;
 
             let cose = webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose_bytes)?;
-            let policy = webauthn_verification::WebAuthnPolicy::default_prod();
+            // Prefer the signed per-project policy if the caller provided
+            // one AND it verified upstream (see project_config::
+            // resolve_policy). If not, fall back to the hardcoded
+            // Rift-only default — same behaviour as before this feature.
+            let default_policy = webauthn_verification::WebAuthnPolicy::default_prod();
+            let policy = per_project_policy.unwrap_or(&default_policy);
             webauthn_verification::verify_assertion(
                 &cose,
                 &client_data_json,
                 &authenticator_data,
                 &signature,
                 user_op_hash,
-                &policy,
+                policy,
             )
         }
     }
