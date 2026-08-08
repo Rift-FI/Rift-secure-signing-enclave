@@ -1213,11 +1213,23 @@ async fn process_reseal_v3(
     // ── 5. Verify consent proof against EXISTING methods ─────────────
     // Same `verify_auth_proof` used on the sign path. Only a user who
     // could already sign for this wallet can add or remove methods.
+    //
+    // Per-project policy: passing None here means reseal always uses
+    // the hardcoded default policy (Rift's own domains). For a
+    // per-project (blockfinax) user, that means they cannot reseal
+    // — the WebAuthn assertion from their origin will fail the
+    // default-policy origin check. Follow-up: thread project_id +
+    // signed_config_json/_signature_b64 through ResealV3Request the
+    // same way SignRequest does, and pass a per-project policy here.
+    // For MVP, blockfinax users add methods via the initial migrate-
+    // to-v3 path (which doesn't require an existing auth_proof); this
+    // path is only hit for later add/remove.
     verify_auth_proof(
         &req.auth_proof,
         &existing_methods,
         &hash_arr,
         attestation_ts,
+        None,
     )
     .context("reseal-v3 auth_proof verification failed")?;
 
