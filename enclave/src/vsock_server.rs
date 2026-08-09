@@ -460,19 +460,28 @@ fn verify_auth_proof(
     methods: &[envelope_v3::AuthMethod],
     user_op_hash: &[u8; 32],
     now_unix_secs: i64,
-    per_project_policy: Option<&webauthn_verification::WebAuthnPolicy>,
+    per_project_policy: Option<&project_config::ResolvedProjectPolicy>,
 ) -> Result<()> {
     match proof {
         AuthProof::Oidc { id_token } => {
             let user_op_hash_hex = hex::encode(user_op_hash);
             let jwks = pinned_jwks::current_jwks();
             let policy = oidc_verification::OidcTrustPolicy::default_prod();
+            // Merge per-project OIDC audiences with the baked default
+            // list. For partners with their own Google client_id
+            // (e.g. Blockfinax) this is the only way an id_token
+            // with their aud passes the accept-list check.
+            let empty: Vec<String> = Vec::new();
+            let extra_audiences = per_project_policy
+                .map(|p| p.oidc_audiences.as_slice())
+                .unwrap_or(empty.as_slice());
             let verified = oidc_verification::verify_id_token(
                 id_token,
                 &user_op_hash_hex,
                 now_unix_secs,
                 &jwks,
                 &policy,
+                extra_audiences,
             )?;
             // Must match an enrolled OIDC method by (iss, sub).
             let matched = methods.iter().any(|m| match m {
@@ -517,12 +526,15 @@ fn verify_auth_proof(
                 .ok_or_else(|| anyhow!("no enrolled passkey matches the assertion's cred_id"))?;
 
             let cose = webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose_bytes)?;
-            // Prefer the signed per-project policy if the caller provided
-            // one AND it verified upstream (see project_config::
-            // resolve_policy). If not, fall back to the hardcoded
-            // Rift-only default — same behaviour as before this feature.
+            // Prefer the signed per-project policy's WebAuthn overrides
+            // if the caller provided a bundle AND it verified upstream
+            // (see project_config::resolve_policy). If not, fall back
+            // to the hardcoded Rift-only default — same behaviour as
+            // before this feature.
             let default_policy = webauthn_verification::WebAuthnPolicy::default_prod();
-            let policy = per_project_policy.unwrap_or(&default_policy);
+            let policy = per_project_policy
+                .map(|p| &p.webauthn)
+                .unwrap_or(&default_policy);
             webauthn_verification::verify_assertion(
                 &cose,
                 &client_data_json,
