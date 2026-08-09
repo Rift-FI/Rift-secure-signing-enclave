@@ -362,6 +362,22 @@ pub struct ResealV3Request {
     pub prehashed_hex: String,
     /// The new method to append to the enrolled_methods list.
     pub new_method: EnrolledMethod,
+    /// Rift project id the reseal request belongs to. Used together
+    /// with `signed_config_json` + `signed_config_signature_b64` to
+    /// resolve a per-project WebAuthn accept-list so partner-hosted
+    /// origins (e.g. Blockfinax's www.blockfinax.com) pass the
+    /// verify_auth_proof origin check. Optional for backward compat —
+    /// absent means "use the hardcoded default policy" (same as v1
+    /// behaviour of this endpoint).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Canonical JSON of the signed per-project accept-list config.
+    /// See `project_config::resolve_policy` for shape and rules.
+    #[serde(default)]
+    pub signed_config_json: Option<String>,
+    /// Standard-base64 signature over sha256(signed_config_json).
+    #[serde(default)]
+    pub signed_config_signature_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

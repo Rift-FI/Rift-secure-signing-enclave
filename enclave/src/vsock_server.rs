@@ -1214,22 +1214,30 @@ async fn process_reseal_v3(
     // Same `verify_auth_proof` used on the sign path. Only a user who
     // could already sign for this wallet can add or remove methods.
     //
-    // Per-project policy: passing None here means reseal always uses
-    // the hardcoded default policy (Rift's own domains). For a
-    // per-project (blockfinax) user, that means they cannot reseal
-    // — the WebAuthn assertion from their origin will fail the
-    // default-policy origin check. Follow-up: thread project_id +
-    // signed_config_json/_signature_b64 through ResealV3Request the
-    // same way SignRequest does, and pass a per-project policy here.
-    // For MVP, blockfinax users add methods via the initial migrate-
-    // to-v3 path (which doesn't require an existing auth_proof); this
-    // path is only hit for later add/remove.
+    // Per-project policy: resolve the same signed accept-list bundle
+    // used on the sign path. Without this, a partner-hosted origin
+    // (e.g. Blockfinax's www.blockfinax.com) fails the default-policy
+    // origin check even though its signed bundle is valid. Never
+    // hard-errors — a broken bundle silently degrades to the hardcoded
+    // default, so this feature can't take down Rift users.
+    let per_project_policy = match (
+        req.signed_config_json.as_deref(),
+        req.signed_config_signature_b64.as_deref(),
+        req.project_id.as_deref(),
+    ) {
+        (Some(json), Some(sig), Some(pid)) => {
+            project_config::resolve_policy(json.as_bytes(), sig, attestation_ts, pid)
+                .unwrap_or(None)
+        }
+        _ => None,
+    };
+
     verify_auth_proof(
         &req.auth_proof,
         &existing_methods,
         &hash_arr,
         attestation_ts,
-        None,
+        per_project_policy.as_ref(),
     )
     .context("reseal-v3 auth_proof verification failed")?;
 
