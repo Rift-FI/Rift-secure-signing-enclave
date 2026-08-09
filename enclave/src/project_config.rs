@@ -101,14 +101,41 @@ pub const RIFT_PROJECT_CONFIG_SIGNING_PUBKEY: [u8; 32] = [
 const MAX_CONFIG_AGE_SECS: i64 = 90 * 24 * 60 * 60;
 
 /// Deserialised view of the signed JSON payload. Field names + order
-/// MUST match the canonical JSON the backend produces.
+/// MUST match the canonical JSON the backend produces (alphabetical
+/// key order).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignedProjectConfig {
+    /// Extra OAuth client_ids (Google/Apple aud values) accepted for
+    /// this project on top of the enclave's baked-in default list.
+    /// Optional: omitted OR empty means "no per-project OIDC additions",
+    /// so any OIDC signing for this project must use one of the baked
+    /// audiences (which for a non-Rift partner will always fail).
+    /// Backward compat: bundles signed before this field existed just
+    /// parse it as empty via #[serde(default)].
+    #[serde(default)]
+    pub accepted_audiences: Vec<String>,
     pub accepted_origins: Vec<String>,
     pub accepted_rp_ids: Vec<String>,
     pub project_id: String,
     /// Unix seconds. Verifier enforces MAX_CONFIG_AGE_SECS.
     pub signed_at: i64,
+}
+
+/// Bundled per-project policy the caller (vsock_server) hands to
+/// verify_auth_proof. Groups the two policies that a project can
+/// override in one object so the sign path can either accept them
+/// wholesale or fall back to hardcoded defaults, not have to check
+/// each subsystem separately.
+///
+/// Not derived Debug/Clone because WebAuthnPolicy contains &'static
+/// slices that make those derives awkward, and neither is needed on
+/// the hot path (this struct is built once per sign request and
+/// consumed immediately).
+pub struct ResolvedProjectPolicy {
+    pub webauthn: WebAuthnPolicy,
+    /// Additional OIDC audiences merged with the enclave's default
+    /// list at verify time. Empty means "no per-project additions".
+    pub oidc_audiences: Vec<String>,
 }
 
 /// Verify a signed per-project config and produce a WebAuthnPolicy
@@ -133,9 +160,9 @@ pub fn resolve_policy(
     signature_b64: &str,
     now_unix_secs: i64,
     expected_project_id: &str,
-) -> Result<Option<WebAuthnPolicy>> {
+) -> Result<Option<ResolvedProjectPolicy>> {
     match verify_and_parse(signed_config_json, signature_b64, now_unix_secs, expected_project_id) {
-        Ok(policy) => Ok(Some(policy)),
+        Ok(bundle) => Ok(Some(bundle)),
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -152,7 +179,7 @@ fn verify_and_parse(
     signature_b64: &str,
     now_unix_secs: i64,
     expected_project_id: &str,
-) -> Result<WebAuthnPolicy> {
+) -> Result<ResolvedProjectPolicy> {
     // 1. Decode signature (STANDARD base64, 64 raw bytes for ed25519).
     let sig_bytes = B64
         .decode(signature_b64.trim())
@@ -225,15 +252,18 @@ fn verify_and_parse(
         );
     }
 
-    // 7. Build the per-project policy. We hold the lists as owned
-    //    Vec<String>, but WebAuthnPolicy uses &'static [&'static str]
-    //    because the hardcoded default is compiled in. See
-    //    WebAuthnPolicy::from_owned for how we adapt.
-    Ok(WebAuthnPolicy::from_owned(
-        cfg.accepted_rp_ids,
-        cfg.accepted_origins,
-        /* require_user_verified */ true,
-    ))
+    // 7. Build the per-project policy bundle. WebAuthn lists become
+    //    owned via from_owned (see webauthn_verification::RpList).
+    //    OIDC audiences pass through as-is; verify_id_token merges
+    //    them with the baked default at verify time.
+    Ok(ResolvedProjectPolicy {
+        webauthn: WebAuthnPolicy::from_owned(
+            cfg.accepted_rp_ids,
+            cfg.accepted_origins,
+            /* require_user_verified */ true,
+        ),
+        oidc_audiences: cfg.accepted_audiences,
+    })
 }
 
 #[cfg(test)]
@@ -263,7 +293,7 @@ mod tests {
         signature_b64: &str,
         now_unix_secs: i64,
         expected_project_id: &str,
-    ) -> Result<WebAuthnPolicy> {
+    ) -> Result<ResolvedProjectPolicy> {
         let sig_bytes = B64.decode(signature_b64.trim()).unwrap();
         let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
         let sig = Signature::from_bytes(&sig_arr);
@@ -282,11 +312,14 @@ mod tests {
         if cfg.accepted_origins.is_empty() || cfg.accepted_rp_ids.is_empty() {
             anyhow::bail!("empty");
         }
-        Ok(WebAuthnPolicy::from_owned(
-            cfg.accepted_rp_ids,
-            cfg.accepted_origins,
-            true,
-        ))
+        Ok(ResolvedProjectPolicy {
+            webauthn: WebAuthnPolicy::from_owned(
+                cfg.accepted_rp_ids,
+                cfg.accepted_origins,
+                true,
+            ),
+            oidc_audiences: cfg.accepted_audiences,
+        })
     }
 
     #[test]
@@ -299,9 +332,11 @@ mod tests {
             now - 60
         );
         let sig = signed_bundle(&sk, json.as_bytes());
-        let policy = verify_with_pubkey(&pubkey, json.as_bytes(), &sig, now, "proj-1").unwrap();
-        assert_eq!(policy.owned_origins().unwrap(), &["https://app.acme.com"]);
-        assert_eq!(policy.owned_rp_ids().unwrap(), &["acme.com"]);
+        let bundle = verify_with_pubkey(&pubkey, json.as_bytes(), &sig, now, "proj-1").unwrap();
+        assert_eq!(bundle.webauthn.owned_origins().unwrap(), &["https://app.acme.com"]);
+        assert_eq!(bundle.webauthn.owned_rp_ids().unwrap(), &["acme.com"]);
+        // Old-format JSON has no accepted_audiences → parses as empty.
+        assert!(bundle.oidc_audiences.is_empty());
     }
 
     #[test]

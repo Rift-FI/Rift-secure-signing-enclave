@@ -151,12 +151,20 @@ pub struct VerifiedOidc {
 /// Nitro attestation document — that's a trusted clock source. Using
 /// the host's wall clock would defeat the purpose since the host is
 /// untrusted.
+// `extra_audiences` (added below): additional aud values accepted for
+// this call, sourced from a verified per-project signed config bundle
+// at the caller. Empty slice means "no per-project additions"; the aud
+// must then match the baked default. Kept as a separate parameter
+// (rather than mutating `policy`) so the `OidcTrustPolicy` struct stays
+// `&'static` and the compile-time-pinned default is unmoved. Order
+// doesn't matter — this is a set-membership check.
 pub fn verify_id_token(
     id_token: &str,
     expected_nonce_hex: &str,
     now_unix_secs: i64,
     jwks: &[PinnedJwk],
     policy: &OidcTrustPolicy,
+    extra_audiences: &[String],
 ) -> Result<VerifiedOidc> {
     // ─── 1. Parse JWT structure ──────────────────────────────────────
     let parts: Vec<&str> = id_token.split('.').collect();
@@ -212,7 +220,13 @@ pub fn verify_id_token(
     }
 
     // ─── 5. Verify the claims ────────────────────────────────────────
-    // 5a. aud — must be in our pinned audience list.
+    // 5a. aud — must be in the baked default list OR the per-project
+    // extras list. Helper closure keeps both membership checks in one
+    // place so the array-branch and single-string branch stay in sync.
+    let is_accepted_aud = |s: &str| -> bool {
+        policy.accepted_audiences.contains(&s)
+            || extra_audiences.iter().any(|e| e == s)
+    };
     let aud_str = match &claims.aud {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
@@ -222,7 +236,7 @@ pub fn verify_id_token(
             let mut matched: Option<String> = None;
             for v in arr {
                 if let Some(s) = v.as_str() {
-                    if policy.accepted_audiences.contains(&s) {
+                    if is_accepted_aud(s) {
                         matched = Some(s.to_string());
                         break;
                     }
@@ -232,7 +246,7 @@ pub fn verify_id_token(
         }
         _ => bail!("aud claim has unexpected type"),
     };
-    if !policy.accepted_audiences.contains(&aud_str.as_str()) {
+    if !is_accepted_aud(&aud_str) {
         bail!("aud {} is not in the pinned accept list", aud_str);
     }
 
@@ -454,7 +468,7 @@ mod tests {
             now - 10,
             now + 600,
         );
-        let verified = verify_id_token(&jwt, "0xdeadbeef", now, &[jwk], &test_policy()).unwrap();
+        let verified = verify_id_token(&jwt, "0xdeadbeef", now, &[jwk], &test_policy(), &[]).unwrap();
         assert_eq!(verified.iss, "https://accounts.google.com");
         assert_eq!(verified.sub, "user-google-123");
     }
@@ -471,7 +485,7 @@ mod tests {
             now - 5,
             now + 300,
         );
-        let verified = verify_id_token(&jwt, "0xfeedface", now, &[jwk], &test_policy()).unwrap();
+        let verified = verify_id_token(&jwt, "0xfeedface", now, &[jwk], &test_policy(), &[]).unwrap();
         assert_eq!(verified.iss, "https://appleid.apple.com");
         assert_eq!(verified.sub, "user.apple.456");
     }
@@ -488,7 +502,7 @@ mod tests {
             now,
             now + 60,
         );
-        let err = verify_id_token(&jwt, "0xbbbb", now, &[jwk], &test_policy()).unwrap_err();
+        let err = verify_id_token(&jwt, "0xbbbb", now, &[jwk], &test_policy(), &[]).unwrap_err();
         assert!(err.to_string().contains("nonce"), "{err:#}");
     }
 
@@ -504,7 +518,7 @@ mod tests {
             now - 1000,
             now - 1, // already expired
         );
-        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy()).unwrap_err();
+        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy(), &[]).unwrap_err();
         assert!(err.to_string().contains("expired"), "{err:#}");
     }
 
@@ -521,7 +535,7 @@ mod tests {
             now + 60,
         );
         jwk.kid = "different-kid".into();
-        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy()).unwrap_err();
+        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy(), &[]).unwrap_err();
         assert!(err.to_string().contains("no pinned JWK"), "{err:#}");
     }
 
@@ -537,7 +551,7 @@ mod tests {
             now,
             now + 60,
         );
-        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy()).unwrap_err();
+        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy(), &[]).unwrap_err();
         assert!(err.to_string().contains("issuer"), "{err:#}");
     }
 
@@ -553,7 +567,7 @@ mod tests {
             now,
             now + 60,
         );
-        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy()).unwrap_err();
+        let err = verify_id_token(&jwt, "0xa", now, &[jwk], &test_policy(), &[]).unwrap_err();
         assert!(err.to_string().contains("aud"), "{err:#}");
     }
 
@@ -572,7 +586,7 @@ mod tests {
         let header_b64 = b64u(serde_json::to_vec(&header).unwrap().as_slice());
         let payload_b64 = b64u(serde_json::to_vec(&claims).unwrap().as_slice());
         let jwt = format!("{header_b64}.{payload_b64}.AAAA");
-        let err = verify_id_token(&jwt, "0xa", 100, &[], &test_policy()).unwrap_err();
+        let err = verify_id_token(&jwt, "0xa", 100, &[], &test_policy(), &[]).unwrap_err();
         assert!(err.to_string().contains("unsupported algorithm"), "{err:#}");
     }
 }
