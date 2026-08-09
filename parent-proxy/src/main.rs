@@ -239,6 +239,24 @@ struct SignBody {
     v3_envelope_blob: Option<String>,
     #[serde(default)]
     auth_proof: Option<serde_json::Value>,
+
+    // ─── Option C: per-project signed accept-list bundle ────────────
+    // Optional. When present the enclave verifies the bundle against
+    // its baked ed25519 pubkey and uses the project's own accept lists
+    // (WebAuthn origins + OIDC audiences) instead of the hardcoded
+    // Rift-only default. Missing → enclave falls back to default
+    // policy, same as before Option C — so Rift users unaffected.
+    //
+    // MUST forward these to the enclave verbatim in the json! macro
+    // below, otherwise partner users (Blockfinax etc.) hit
+    // "aud/origin not in the pinned accept list" errors even when
+    // backend + smart-wallet correctly attach the bundle upstream.
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    signed_config_json: Option<String>,
+    #[serde(default)]
+    signed_config_signature_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,6 +327,13 @@ async fn sign_handler(
             "kms_key_arn": body.kms_key_arn,
             "v3_envelope_blob": body.v3_envelope_blob,
             "auth_proof": body.auth_proof,
+            // Option C — forward the signed per-project bundle to the
+            // enclave. Enclave verifies the ed25519 signature against
+            // its baked pubkey and applies the project's accept lists
+            // if valid; otherwise falls back to hardcoded default.
+            "project_id": body.project_id,
+            "signed_config_json": body.signed_config_json,
+            "signed_config_signature_b64": body.signed_config_signature_b64,
         });
 
         match forward_to_enclave(state.enclave_cid, state.enclave_port, &enclave_req).await {
@@ -657,6 +682,20 @@ struct ResealBody {
     /// refuses if this would duplicate an existing entry (by (iss, sub)
     /// for OIDC, by cred_id for passkey).
     new_method: serde_json::Value,
+
+    // ─── Option C: per-project signed accept-list bundle ────────────
+    // Optional. Same wire shape as SignBody — see the comment there
+    // for why these are forwarded. Reseal path uses the SAME
+    // verify_auth_proof code as sign, so without these fields any
+    // partner user (e.g. Blockfinax) trying to add a method fails
+    // with "origin/aud not in pinned accept list" for their
+    // WebAuthn assertion or Google id_token.
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    signed_config_json: Option<String>,
+    #[serde(default)]
+    signed_config_signature_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -698,6 +737,13 @@ async fn reseal_v3_handler(
             "auth_proof": body.auth_proof,
             "prehashed_hex": body.prehashed_hex,
             "new_method": body.new_method,
+            // Option C — same as sign_handler. Without these forwarded,
+            // reseal-v3 (add-passkey / link-google) fails for any
+            // partner project whose users' assertions don't match the
+            // hardcoded Rift-only default accept list.
+            "project_id": body.project_id,
+            "signed_config_json": body.signed_config_json,
+            "signed_config_signature_b64": body.signed_config_signature_b64,
         });
 
         match forward_to_enclave(
