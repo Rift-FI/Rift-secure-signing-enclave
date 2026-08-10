@@ -79,11 +79,25 @@ run-debug: eif
 	@echo "Enclave running. Tail console with: make console"
 
 .PHONY: run
+# The vsock CID is pinned so parent-proxy's /etc/rift-parent-proxy.env
+# stays static across restarts. Otherwise nitro-cli auto-picks a CID
+# from a small pool (typically 16-20, growing as enclaves come and go)
+# and every restart forces a matching `sed -i` in parent-proxy's env
+# + a systemctl restart. Historically that drift broke us: on
+# 2026-08-10 the rotation Lambda started the fresh enclave at CID 17,
+# our manual recovery restart came up at CID 21, and parent-proxy —
+# still pointing at 17 — timed out every vsock connect. Pinning here
+# means `make run` after `make kill` produces a bitwise-identical
+# systemd state; only the EIF changes.
+#
+# Override via `make run ENCLAVE_CID=42` if 17 is in use.
+ENCLAVE_CID ?= 17
 run: eif
 	sudo nitro-cli run-enclave \
 	  --eif-path $(EIF) \
 	  --memory $(ENCLAVE_MEMORY_MIB) \
-	  --cpu-count $(ENCLAVE_CPUS)
+	  --cpu-count $(ENCLAVE_CPUS) \
+	  --enclave-cid $(ENCLAVE_CID)
 
 .PHONY: console
 console:
