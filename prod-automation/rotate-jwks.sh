@@ -41,6 +41,31 @@ command -v jq   >/dev/null 2>&1 || die "jq required"
 [[ -f tools/fetch-jwks.mjs ]] || die "tools/fetch-jwks.mjs missing"
 [[ -f enclave/src/pinned_jwks.rs ]] || die "enclave/src/pinned_jwks.rs missing"
 
+log "── STEP 0: sync repo to origin/main before rebuilding ──"
+# Prevents regressions like 2026-08-10, where this script ran against
+# a checkout on tag v1.0.0 (pre-Option-C) and rebuilt an enclave binary
+# missing per-project accept-list support. Any partner (Blockfinax etc.)
+# with a signed_config bundle was silently rejected until we manually
+# `git pull`'d and rebuilt.
+#
+# `git stash -u` protects local edits (Makefile tweaks, previous
+# pinned_jwks.rs from an earlier rotation) — we restore them in STEP 2
+# by re-patching the fresh main-branch pinned_jwks.rs anyway.
+#
+# Failure to sync is FATAL — better to alert on a stale checkout than
+# silently rebuild yesterday's binary. Ops sees the alert, fixes the
+# repo state manually, re-runs the rotation.
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+log "current branch: $CURRENT_BRANCH"
+git fetch origin main 2>&1 | sed 's/^/  /' || die "git fetch failed — check remote + credentials"
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    log "switching from '$CURRENT_BRANCH' to main"
+    git stash push -u -m "rotate-jwks pre-sync $(date -Is)" 2>&1 | sed 's/^/  /' || true
+    git checkout main || die "git checkout main failed"
+fi
+git pull --ff-only origin main 2>&1 | sed 's/^/  /' || die "git pull --ff-only failed — resolve divergence manually"
+log "synced to $(git log -1 --oneline)"
+
 log "── STEP 1: fetch fresh JWKS from Google + Apple ──"
 node tools/fetch-jwks.mjs > "$JWKS_SNIPPET" || die "fetch-jwks failed"
 log "wrote $JWKS_SNIPPET ($(wc -l < "$JWKS_SNIPPET") lines)"
