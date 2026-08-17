@@ -168,13 +168,20 @@ def handler(event, context):
         # script. PATH is set so nitro-cli / docker / node / jq resolve
         # even without a login shell.
         log.info("step 1: rotate-jwks.sh")
+        # Invoke via `bash` (not `./`) so the run doesn't hard-depend on
+        # the on-disk +x bit. Git's index tracks the executable mode, but
+        # the mode is easy to lose on commits authored from Windows (that's
+        # what caused the 2026-08-17 Monday rotation to fail with
+        # "Permission denied"). With `bash SCRIPT` the shell reads the file
+        # itself and mode doesn't matter — belt & braces for a script that
+        # runs unattended on a cron.
         stdout, _stderr = ssm_run(
             [
                 f"export HOME=/home/ec2-user "
                 f"&& export ENCLAVE_SRC={ENCLAVE_DIR} "
                 f"&& export PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
                 f"&& cd {ENCLAVE_DIR}/prod-automation "
-                f"&& ./rotate-jwks.sh"
+                f"&& bash rotate-jwks.sh"
             ],
             timeout=900,
         )
