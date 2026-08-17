@@ -63,10 +63,14 @@ eif: image
 
 .PHONY: pcr0
 pcr0:
+	@# nitro-cli describe-eif emits JSON. Older versions split "PCR0"
+	@# and its value across two lines; current versions keep them on
+	@# one line — that broke the previous `grep -A1 | tail -1` recipe,
+	@# which then returned the FOLLOWING line ("PCR1": ...) and the
+	@# rotation Lambda failed with "PCR0 wrong length (101, want 96)".
+	@# jq is present on any nitro-cli host, so parse the JSON directly.
 	@sudo nitro-cli describe-eif --eif-path $(EIF) \
-	  | grep -A1 '"PCR0"' \
-	  | tail -1 \
-	  | tr -d ' ",'
+	  | jq -r '.Measurements.PCR0'
 
 .PHONY: run-debug
 run-debug: eif
