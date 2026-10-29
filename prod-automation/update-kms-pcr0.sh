@@ -67,6 +67,8 @@ esac
 command -v jq  >/dev/null 2>&1 || { echo "jq required" >&2; exit 1; }
 command -v aws >/dev/null 2>&1 || { echo "aws cli required" >&2; exit 1; }
 
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/kms-pcr0.XXXXXX")"
+
 fetch_current_pcr0s() {
     local KEY_ID="$1"
     local SID_PREFIX="$2"
@@ -98,9 +100,13 @@ update_key() {
     local SID_PREFIX="$2"
 
     echo "── $KEY_ID ──"
-    local CUR="/tmp/kms-cur-${KEY_ID}.json"
-    local NEW="/tmp/kms-new-${KEY_ID}.json"
-    local BACKUP="/tmp/kms-BACKUP-${KEY_ID}-$(date +%s).json"
+    # Private, unpredictable working files (the old fixed /tmp names
+    # could be pre-created or symlinked by another local user to feed
+    # a crafted policy into put-key-policy). The backup is kept in the
+    # same private dir; its path is printed below.
+    local CUR="$WORKDIR/kms-cur-${KEY_ID}.json"
+    local NEW="$WORKDIR/kms-new-${KEY_ID}.json"
+    local BACKUP="$WORKDIR/kms-BACKUP-${KEY_ID}-$(date +%s).json"
 
     aws kms get-key-policy --region "$REGION" --key-id "$KEY_ID" --policy-name default \
         | jq -r '.Policy' > "$CUR"

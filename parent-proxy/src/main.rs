@@ -1,62 +1,65 @@
-//! Rift parent-proxy: HTTP↔vsock bridge that runs on the EC2 host.
+//! Rift parent-proxy: HTTP↔vsock bridge that runs on the EC2 host,
+//! OUTSIDE the enclave.
 //!
-//! The smart-wallet (Node) cannot speak vsock natively, and the enclave
-//! has no network. This binary sits in between:
+//! ```text
+//!  backend / smart-wallet
+//!    │  HTTP  :7777  /sign /generate-wallet /migrate-envelope /reseal-v3
+//!    │               /health/enclave (canary)
+//!    ▼
+//!  parent-proxy (this binary)
+//!    │  vsock → enclave:5005/5007/5008/5009/5010 (one port per operation)
+//!    │  vsock ← enclave → :5006               (KMS proxy callbacks)
+//!    ▼
+//!  AWS KMS  Decrypt / GenerateDataKey with attestation Recipient
+//! ```
 //!
-//!  Smart-wallet (Node, on EC2)
-//!    ▼ HTTP POST localhost:7777/sign
-//!  Parent proxy (this binary)
-//!    ▼ vsock to enclave:5005      ← signing requests
-//!    ▲ vsock from enclave:5006    ← KMS proxy callbacks
-//!    ▼ HTTPS → AWS KMS Decrypt-with-Recipient
+//! This process holds no key material: KMS encrypts every data key to
+//! the enclave's attested ephemeral RSA key. It does hold the EC2
+//! instance role's KMS permissions and is the only network path to the
+//! enclave, so it is still security-relevant (see `http::BearerAuth`).
 //!
-//! Two concurrent listeners:
-//!  - HTTP on 0.0.0.0:7777 (or 127.0.0.1:7777 if you want it host-local)
-//!    accepts signing requests from the smart-wallet, forwards each one
-//!    to the enclave over vsock, returns the signature.
-//!  - Vsock on port 5006 accepts KMS-proxy requests originating in the
-//!    enclave. Each request carries an attestation document; we call
-//!    KMS Decrypt with that attestation in the Recipient field and
-//!    return the CiphertextForRecipient blob to the enclave.
+//! Modules:
+//!   - [`http`]      — routes, bearer auth, load limits, response mapping
+//!   - [`enclave`]   — forwarding one request to an enclave vsock port
+//!   - [`kms_proxy`] — vsock listener the enclave calls for KMS
+//!   - [`framing`]   — 4-byte length-prefixed JSON frames
 //!
-//! Why a Rust parent proxy instead of Node:
-//!  - Native vsock support is mature in Rust (tokio-vsock), nonexistent
-//!    in Node.
-//!  - aws-sdk-kms in Rust supports the Recipient parameter (attestation
-//!    document + key encryption algorithm) natively.
-//!  - Tiny binary, no node_modules surface, easy systemd unit.
-//!
-//! Env (set in the systemd unit, see DEPLOYMENT.md):
-//!   ENCLAVE_CID                — the enclave's vsock CID (usually 16)
-//!   ENCLAVE_PORT               — the enclave's signing port (default 5005)
-//!   KMS_PROXY_PORT             — the vsock port we listen on (default 5006)
-//!   HTTP_BIND                  — HTTP listen address (default 127.0.0.1:7777)
-//!   AWS_REGION                 — for the AWS KMS client (default us-east-1)
-//!   AWS_ACCESS_KEY_ID / etc.   — standard AWS SDK env, comes from the
-//!                                EC2 instance role most of the time.
+//! Environment (systemd `EnvironmentFile=/etc/rift-parent-proxy.env`):
+//!   ENCLAVE_CID                   enclave vsock CID; also the ONLY peer
+//!                                 CID the KMS proxy accepts  (default 16)
+//!   ENCLAVE_PORT                  sign port                    (default 5005)
+//!   ENCLAVE_GENERATE_WALLET_PORT  generate-wallet port         (default 5007)
+//!   ENCLAVE_MIGRATE_PORT          migrate-envelope port        (default 5008)
+//!   ENCLAVE_RESEAL_PORT           reseal-v3 port               (default 5009)
+//!   ENCLAVE_HEALTH_PORT           health/canary port           (default 5010)
+//!   KMS_PROXY_PORT                vsock port we listen on      (default 5006)
+//!   HTTP_BIND                     HTTP listen address          (default 0.0.0.0:7777)
+//!   PARENT_PROXY_AUTH_TOKEN       Bearer token for all enclave routes.
+//!                                 REQUIRED when HTTP_BIND is not loopback:
+//!                                 the proxy refuses to start without it …
+//!   PARENT_PROXY_ALLOW_INSECURE   … unless this is exactly "1" (logged
+//!                                 loudly at ERROR level on every start).
+//!   PARENT_PROXY_MAX_CONCURRENCY  enclave requests in flight   (default 4)
+//!   PARENT_PROXY_QUEUE_TIMEOUT_MS wait for a slot before 503   (default 10000)
+//!   PARENT_PROXY_REQUEST_TIMEOUT_SECS per-request limit → 504  (default 30)
+//!   AWS_REGION, AWS_*             standard AWS SDK configuration
+//!   RUST_LOG                      tracing filter
 
-use anyhow::{anyhow, bail, Context, Result};
-use aws_sdk_kms::{
-    primitives::Blob,
-    types::{KeyEncryptionMechanism, RecipientInfo},
-    Client as KmsClient,
-};
-use axum::{
-    extract::State,
-    http::{Request, StatusCode},
-    middleware::{self, Next},
-    response::Response,
-    routing::post,
-    Json, Router,
-};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use serde::{Deserialize, Serialize};
+mod enclave;
+mod framing;
+mod http;
+mod kms_proxy;
+
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use aws_sdk_kms::Client as KmsClient;
 use tracing::{error, info, warn};
 
-#[cfg(target_os = "linux")]
-use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
+use crate::enclave::EnclaveEndpoints;
+use crate::http::{AppState, BearerAuth, Limits};
 
 const DEFAULT_ENCLAVE_CID: u32 = 16;
 const DEFAULT_ENCLAVE_PORT: u32 = 5005;
@@ -64,28 +67,12 @@ const DEFAULT_KMS_PROXY_PORT: u32 = 5006;
 const DEFAULT_GENERATE_WALLET_PORT: u32 = 5007;
 const DEFAULT_MIGRATE_PORT: u32 = 5008;
 const DEFAULT_RESEAL_PORT: u32 = 5009;
-// Public by default so Railway smart-wallet can reach us. When you
-// want to keep this proxy localhost-only (smart-wallet on the same
-// host), set HTTP_BIND=127.0.0.1:7777 in the systemd env file.
+const DEFAULT_HEALTH_PORT: u32 = 5010;
+/// Public by default so a remote smart-wallet (behind nginx/TLS) can
+/// reach us. Set `HTTP_BIND=127.0.0.1:7777` to keep it host-local. A
+/// non-loopback bind requires `PARENT_PROXY_AUTH_TOKEN` (see
+/// [`check_auth_posture`]).
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:7777";
-
-#[derive(Clone)]
-struct AppState {
-    enclave_cid: u32,
-    enclave_port: u32,
-    /// Phase 2 — separate vsock port for wallet generation. Decoupled
-    /// from the sign port so a hung signing request doesn't starve
-    /// account creation and vice versa.
-    enclave_generate_wallet_port: u32,
-    /// Phase 3 — separate vsock port for v1/v2 → v3 envelope migration.
-    enclave_migrate_port: u32,
-    /// Phase 3 — separate vsock port for v3 envelope reseal (append or
-    /// remove an enrolled method without changing the EOA key). Own
-    /// port keeps a hung reseal from starving sign / migrate / gw.
-    enclave_reseal_port: u32,
-    #[allow(dead_code)]
-    kms: Arc<KmsClient>,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -97,82 +84,94 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let enclave_cid = env_u32("ENCLAVE_CID", DEFAULT_ENCLAVE_CID);
-    let enclave_port = env_u32("ENCLAVE_PORT", DEFAULT_ENCLAVE_PORT);
-    let enclave_generate_wallet_port = env_u32(
-        "ENCLAVE_GENERATE_WALLET_PORT",
-        DEFAULT_GENERATE_WALLET_PORT,
-    );
-    let enclave_migrate_port = env_u32("ENCLAVE_MIGRATE_PORT", DEFAULT_MIGRATE_PORT);
-    let enclave_reseal_port = env_u32("ENCLAVE_RESEAL_PORT", DEFAULT_RESEAL_PORT);
+    let endpoints = EnclaveEndpoints {
+        cid: env_u32("ENCLAVE_CID", DEFAULT_ENCLAVE_CID),
+        sign_port: env_u32("ENCLAVE_PORT", DEFAULT_ENCLAVE_PORT),
+        generate_wallet_port: env_u32("ENCLAVE_GENERATE_WALLET_PORT", DEFAULT_GENERATE_WALLET_PORT),
+        migrate_port: env_u32("ENCLAVE_MIGRATE_PORT", DEFAULT_MIGRATE_PORT),
+        reseal_port: env_u32("ENCLAVE_RESEAL_PORT", DEFAULT_RESEAL_PORT),
+        health_port: env_u32("ENCLAVE_HEALTH_PORT", DEFAULT_HEALTH_PORT),
+    };
     let kms_proxy_port = env_u32("KMS_PROXY_PORT", DEFAULT_KMS_PROXY_PORT);
     let http_bind = std::env::var("HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.to_string());
+    let auth = Arc::new(BearerAuth::new(
+        &std::env::var("PARENT_PROXY_AUTH_TOKEN").unwrap_or_default(),
+    ));
+    let defaults = Limits::default();
+    let limits = Limits {
+        max_concurrency: env_u32(
+            "PARENT_PROXY_MAX_CONCURRENCY",
+            defaults.max_concurrency as u32,
+        )
+        .max(1) as usize,
+        queue_timeout: Duration::from_millis(u64::from(env_u32(
+            "PARENT_PROXY_QUEUE_TIMEOUT_MS",
+            defaults.queue_timeout.as_millis() as u32,
+        ))),
+        request_timeout: Duration::from_secs(u64::from(env_u32(
+            "PARENT_PROXY_REQUEST_TIMEOUT_SECS",
+            defaults.request_timeout.as_secs() as u32,
+        ))),
+    };
 
     info!(
-        enclave_cid,
-        enclave_port,
-        enclave_generate_wallet_port,
-        enclave_migrate_port,
-        enclave_reseal_port,
+        enclave_cid = endpoints.cid,
+        enclave_port = endpoints.sign_port,
+        enclave_generate_wallet_port = endpoints.generate_wallet_port,
+        enclave_migrate_port = endpoints.migrate_port,
+        enclave_reseal_port = endpoints.reseal_port,
+        enclave_health_port = endpoints.health_port,
         kms_proxy_port,
         http_bind = %http_bind,
+        auth_enabled = auth.is_enabled(),
+        max_concurrency = limits.max_concurrency,
+        queue_timeout_ms = limits.queue_timeout.as_millis() as u64,
+        request_timeout_secs = limits.request_timeout.as_secs(),
         "starting rift-parent-proxy"
     );
 
-    // Pin the AWS SDK behavior version so future SDK upgrades don't
-    // silently change semantics on us. Switching back to `from_env()`
-    // would trigger a deprecation warning every build.
+    let allow_insecure = std::env::var("PARENT_PROXY_ALLOW_INSECURE").ok();
+    match check_auth_posture(auth.is_enabled(), &http_bind, allow_insecure.as_deref()) {
+        AuthPosture::Ok => {}
+        AuthPosture::InsecureOverride => error!(
+            http_bind = %http_bind,
+            "INSECURE: PARENT_PROXY_AUTH_TOKEN is not set and HTTP_BIND is not loopback, \
+             but PARENT_PROXY_ALLOW_INSECURE=1 is set. /sign, /generate-wallet, \
+             /migrate-envelope, /reseal-v3 and /health/enclave are reachable WITHOUT \
+             authentication. Never run like this in production."
+        ),
+        AuthPosture::Refuse => bail!(
+            "refusing to start: HTTP_BIND={http_bind} is not loopback and \
+             PARENT_PROXY_AUTH_TOKEN is not set. Set PARENT_PROXY_AUTH_TOKEN, or bind \
+             HTTP_BIND=127.0.0.1:7777, or (dev only) set PARENT_PROXY_ALLOW_INSECURE=1."
+        ),
+    }
+
+    // `BehaviorVersion::latest()` (rather than the deprecated
+    // `from_env()`) so SDK upgrades don't silently change semantics.
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .load()
         .await;
     let kms = Arc::new(KmsClient::new(&aws_config));
 
-    let state = AppState {
-        enclave_cid,
-        enclave_port,
-        enclave_generate_wallet_port,
-        enclave_migrate_port,
-        enclave_reseal_port,
-        kms: kms.clone(),
-    };
-
-    // ─── vsock KMS proxy ────────────────────────────────────────────
-    // Runs forever in the background. The enclave initiates connections
-    // to this listener whenever it needs an attested KMS Decrypt.
+    // vsock KMS proxy: runs for the life of the process. The enclave
+    // connects here whenever it needs an attested KMS call.
     #[cfg(target_os = "linux")]
     {
-        let kms_for_proxy = kms.clone();
+        let enclave_cid = endpoints.cid;
         tokio::spawn(async move {
-            if let Err(e) = run_kms_proxy(kms_proxy_port, kms_for_proxy).await {
-                error!(error = ?e, "KMS proxy loop terminated");
+            if let Err(e) = kms_proxy::run(kms_proxy_port, enclave_cid, kms).await {
+                tracing::error!(error = ?e, "KMS proxy loop terminated");
             }
         });
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (kms, kms_proxy_port);
+        warn!("non-Linux build: vsock is unavailable, enclave routes will return 502");
+    }
 
-    // ─── HTTP signing frontend ──────────────────────────────────────
-    // Bearer-token auth middleware on /sign. Layered AFTER the health
-    // route so /health stays open for load-balancer probes etc.
-    let app = Router::new()
-        .route(
-            "/sign",
-            post(sign_handler).route_layer(middleware::from_fn(bearer_auth)),
-        )
-        .route(
-            "/generate-wallet",
-            post(generate_wallet_handler).route_layer(middleware::from_fn(bearer_auth)),
-        )
-        .route(
-            "/migrate-envelope",
-            post(migrate_envelope_handler).route_layer(middleware::from_fn(bearer_auth)),
-        )
-        .route(
-            "/reseal-v3",
-            post(reseal_v3_handler).route_layer(middleware::from_fn(bearer_auth)),
-        )
-        .route("/health", post(health_handler))
-        .route("/health", axum::routing::get(health_handler))
-        .with_state(state);
-
+    let app = http::router(AppState { enclave: endpoints }, auth, limits);
     let listener = tokio::net::TcpListener::bind(&http_bind)
         .await
         .with_context(|| format!("bind HTTP listener on {http_bind}"))?;
@@ -181,861 +180,76 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+#[derive(Debug, PartialEq, Eq)]
+enum AuthPosture {
+    /// Token set, or bound to loopback only.
+    Ok,
+    /// No token on a non-loopback bind, explicitly overridden.
+    InsecureOverride,
+    /// No token on a non-loopback bind: fail closed.
+    Refuse,
 }
 
-// ─── HTTP signing frontend ──────────────────────────────────────────
-
-/// JSON body the smart-wallet sends to POST /sign.
-///
-/// Two envelope formats share this body shape:
-///   v1 (legacy KMS-only): set ciphertext_hex + iv_hex. Leave password,
-///        salt_b64, nonce_hex, tag_hex unset.
-///   v2 (password-bound, non-custodial): set ciphertext_hex, password,
-///        salt_b64, nonce_hex, tag_hex. Leave iv_hex unset.
-///
-/// The enclave picks the path. The parent-proxy is a pure pass-through.
-#[derive(Debug, Deserialize)]
-struct SignBody {
-    /// 32-byte Safe UserOp hash, hex-encoded with or without 0x prefix.
-    user_op_hash_hex: String,
-    /// v1 / v2: envelope's wrapped DEK, base64-encoded. Absent for v3 —
-    /// v3 carries the wrapped DEK inside `v3_envelope_blob`, not as a
-    /// top-level field. `#[serde(default)]` so v3 requests deserialize.
-    #[serde(default)]
-    wrapped_dek_b64: String,
-    /// v1 / v2: envelope's ciphertext, hex-encoded. Absent for v3 for
-    /// the same reason as `wrapped_dek_b64`.
-    #[serde(default)]
-    ciphertext_hex: String,
-    /// v1: the AES-CBC IV, hex-encoded (16 bytes). Empty string in v2 / v3.
-    #[serde(default)]
-    iv_hex: String,
-    /// v2: the user's password (plaintext UTF-8). Empty in v1.
-    #[serde(default)]
-    password: Option<String>,
-    /// v2: HKDF salt, base64-encoded (32 bytes). Empty in v1.
-    #[serde(default)]
-    salt_b64: Option<String>,
-    /// v2: AES-GCM nonce, hex-encoded (12 bytes). Empty in v1.
-    #[serde(default)]
-    nonce_hex: Option<String>,
-    /// v2: AES-GCM auth tag, hex-encoded (16 bytes). Empty in v1.
-    #[serde(default)]
-    tag_hex: Option<String>,
-    /// CMK ARN for the active mode (production/sandbox).
-    kms_key_arn: String,
-
-    // ─── v3 (device-bound, no password) fields ──────────────────────
-    // When `v3_envelope_blob` is set the enclave ignores all v1/v2
-    // fields above. `auth_proof` carries the user's consent — either
-    // an OIDC id_token whose `nonce` is the user op hash, or a
-    // WebAuthn assertion challenged with the user op hash.
-    #[serde(default)]
-    v3_envelope_blob: Option<String>,
-    #[serde(default)]
-    auth_proof: Option<serde_json::Value>,
-
-    // ─── Option C: per-project signed accept-list bundle ────────────
-    // Optional. When present the enclave verifies the bundle against
-    // its baked ed25519 pubkey and uses the project's own accept lists
-    // (WebAuthn origins + OIDC audiences) instead of the hardcoded
-    // Rift-only default. Missing → enclave falls back to default
-    // policy, same as before Option C — so Rift users unaffected.
-    //
-    // MUST forward these to the enclave verbatim in the json! macro
-    // below, otherwise partner users (Blockfinax etc.) hit
-    // "aud/origin not in the pinned accept list" errors even when
-    // backend + smart-wallet correctly attach the bundle upstream.
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    signed_config_json: Option<String>,
-    #[serde(default)]
-    signed_config_signature_b64: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SignSuccess {
-    signature_hex: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SignError {
-    error: String,
-}
-
-async fn health_handler() -> &'static str {
-    "ok"
-}
-
-/// Bearer-token auth — reads the expected secret from
-/// `PARENT_PROXY_AUTH_TOKEN` env at request time so a rotation
-/// (write new env, `systemctl restart rift-parent-proxy`) takes
-/// effect without rebuilding.
-///
-/// When the env var is unset/empty, auth is DISABLED. This keeps
-/// `make run-debug` + curl-smoke-test ergonomic on the EC2 itself
-/// (parent-proxy listening on localhost, no public exposure yet).
-/// Setting the env var locks down /sign immediately on next restart.
-async fn bearer_auth(
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> Result<Response, (StatusCode, Json<SignError>)> {
-    let expected = std::env::var("PARENT_PROXY_AUTH_TOKEN").unwrap_or_default();
-    if expected.is_empty() {
-        return Ok(next.run(req).await);
-    }
-    let header = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let want = format!("Bearer {expected}");
-    if header == want {
-        Ok(next.run(req).await)
+/// Fail-closed startup rule: an unauthenticated proxy may only listen on
+/// loopback, unless the operator sets `PARENT_PROXY_ALLOW_INSECURE=1`
+/// (exactly "1"; anything else is ignored).
+fn check_auth_posture(auth_enabled: bool, http_bind: &str, allow_insecure: Option<&str>) -> AuthPosture {
+    if auth_enabled || is_loopback_bind(http_bind) {
+        AuthPosture::Ok
+    } else if allow_insecure.map(str::trim) == Some("1") {
+        AuthPosture::InsecureOverride
     } else {
-        warn!("rejected /sign request — missing or wrong Bearer token");
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(SignError {
-                error: "unauthorized".to_string(),
-            }),
-        ))
+        AuthPosture::Refuse
     }
 }
 
-async fn sign_handler(
-    State(state): State<AppState>,
-    Json(body): Json<SignBody>,
-) -> Result<Json<SignSuccess>, (StatusCode, Json<SignError>)> {
-    #[cfg(target_os = "linux")]
-    {
-        let enclave_req = serde_json::json!({
-            "user_op_hash_hex": body.user_op_hash_hex,
-            "wrapped_dek_b64": body.wrapped_dek_b64,
-            "ciphertext_hex": body.ciphertext_hex,
-            "iv_hex": body.iv_hex,
-            "password": body.password,
-            "salt_b64": body.salt_b64,
-            "nonce_hex": body.nonce_hex,
-            "tag_hex": body.tag_hex,
-            "kms_key_arn": body.kms_key_arn,
-            "v3_envelope_blob": body.v3_envelope_blob,
-            "auth_proof": body.auth_proof,
-            // Option C — forward the signed per-project bundle to the
-            // enclave. Enclave verifies the ed25519 signature against
-            // its baked pubkey and applies the project's accept lists
-            // if valid; otherwise falls back to hardcoded default.
-            "project_id": body.project_id,
-            "signed_config_json": body.signed_config_json,
-            "signed_config_signature_b64": body.signed_config_signature_b64,
-        });
-
-        match forward_to_enclave(state.enclave_cid, state.enclave_port, &enclave_req).await {
-            Ok(resp) => {
-                if let Some(sig) = resp
-                    .get("Ok")
-                    .and_then(|ok| ok.get("signature_hex"))
-                    .and_then(|s| s.as_str())
-                {
-                    Ok(Json(SignSuccess {
-                        signature_hex: sig.to_string(),
-                    }))
-                } else if let Some(err) = resp
-                    .get("Err")
-                    .and_then(|e| e.get("reason"))
-                    .and_then(|s| s.as_str())
-                {
-                    warn!(reason = %err, "enclave returned error");
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("enclave: {err}"),
-                        }),
-                    ))
-                } else {
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("malformed enclave response: {resp}"),
-                        }),
-                    ))
-                }
-            }
-            Err(e) => {
-                error!(error = ?e, "forward to enclave failed");
-                Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(SignError {
-                        error: format!("forward to enclave: {e:#}"),
-                    }),
-                ))
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (state, body);
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SignError {
-                error: "parent proxy only runs on Linux".to_string(),
-            }),
-        ))
+/// Read a `u32` env var. Unset ⇒ `default`. Set-but-unparseable ⇒
+/// `default` too (unchanged behaviour), but now with a warning, since
+/// silently falling back on e.g. a mistyped `ENCLAVE_CID` sends every
+/// request to the wrong enclave.
+fn env_u32(name: &str, default: u32) -> u32 {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            warn!(var = name, value = %raw, default, "unparseable env var; using default");
+            default
+        }),
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn forward_to_enclave(
-    enclave_cid: u32,
-    enclave_port: u32,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    let addr = VsockAddr::new(enclave_cid, enclave_port);
-    let mut stream = VsockStream::connect(addr)
-        .await
-        .with_context(|| format!("vsock connect to enclave at cid={enclave_cid} port={enclave_port}"))?;
-    let payload = serde_json::to_vec(body)?;
-    write_frame(&mut stream, &payload).await?;
-    let resp_bytes = read_frame(&mut stream).await?;
-    let resp: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
-    Ok(resp)
+/// True only for literal loopback socket addresses. Hostnames
+/// (including "localhost") return false so the check errs on the side
+/// of requiring a token.
+fn is_loopback_bind(bind: &str) -> bool {
+    bind.parse::<SocketAddr>()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false)
 }
 
-// ─── /generate-wallet HTTP handler ──────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// JSON body the backend sends to POST /generate-wallet.
-///
-/// Format-selection cascade (first match wins):
-///   1. `enrolled_methods` non-empty → v3 (Passkey / OIDC bound)
-///   2. `password` present           → v2 (password-bound)
-///   3. otherwise                    → v1 (KMS-only, legacy)
-///
-/// The parent-proxy is a pass-through; the enclave does the picking.
-#[derive(Debug, Deserialize)]
-struct GenerateWalletBody {
-    /// CMK to wrap the freshly-generated DEK with.
-    kms_key_arn: String,
-    /// v2 path: the user's password.
-    #[serde(default)]
-    password: Option<String>,
-    /// v3 path: enrolled auth methods (OIDC and/or Passkey).
-    #[serde(default)]
-    enrolled_methods: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct GenerateWalletSuccess {
-    envelope_blob: String,
-    owner_address: String,
-}
-
-async fn generate_wallet_handler(
-    State(state): State<AppState>,
-    Json(body): Json<GenerateWalletBody>,
-) -> Result<Json<GenerateWalletSuccess>, (StatusCode, Json<SignError>)> {
-    #[cfg(target_os = "linux")]
-    {
-        let enclave_req = serde_json::json!({
-            "kms_key_arn": body.kms_key_arn,
-            "password": body.password,
-            "enrolled_methods": body.enrolled_methods,
-        });
-
-        match forward_to_enclave(
-            state.enclave_cid,
-            state.enclave_generate_wallet_port,
-            &enclave_req,
-        )
-        .await
-        {
-            Ok(resp) => {
-                if let Some(ok) = resp.get("Ok") {
-                    let envelope_blob = ok
-                        .get("envelope_blob")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let owner_address = ok
-                        .get("owner_address")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if envelope_blob.is_empty() || owner_address.is_empty() {
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            Json(SignError {
-                                error: format!("malformed enclave response: {resp}"),
-                            }),
-                        ));
-                    }
-                    Ok(Json(GenerateWalletSuccess {
-                        envelope_blob,
-                        owner_address,
-                    }))
-                } else if let Some(err) = resp
-                    .get("Err")
-                    .and_then(|e| e.get("reason"))
-                    .and_then(|s| s.as_str())
-                {
-                    warn!(reason = %err, "enclave generate-wallet returned error");
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("enclave: {err}"),
-                        }),
-                    ))
-                } else {
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("malformed enclave response: {resp}"),
-                        }),
-                    ))
-                }
-            }
-            Err(e) => {
-                error!(error = ?e, "forward to enclave (generate-wallet) failed");
-                Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(SignError {
-                        error: format!("forward to enclave: {e:#}"),
-                    }),
-                ))
-            }
-        }
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback_bind("127.0.0.1:7777"));
+        assert!(is_loopback_bind("[::1]:7777"));
+        assert!(!is_loopback_bind("0.0.0.0:7777"));
+        assert!(!is_loopback_bind("10.0.0.5:7777"));
+        assert!(!is_loopback_bind("localhost:7777"));
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (state, body);
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SignError {
-                error: "parent proxy only runs on Linux".to_string(),
-            }),
-        ))
+    #[test]
+    fn fails_closed_without_token_on_public_bind() {
+        assert_eq!(check_auth_posture(false, "0.0.0.0:7777", None), AuthPosture::Refuse);
+        assert_eq!(check_auth_posture(false, "0.0.0.0:7777", Some("0")), AuthPosture::Refuse);
+        assert_eq!(check_auth_posture(false, "0.0.0.0:7777", Some("true")), AuthPosture::Refuse);
+        assert_eq!(check_auth_posture(false, "localhost:7777", None), AuthPosture::Refuse);
+        assert_eq!(
+            check_auth_posture(false, "0.0.0.0:7777", Some("1")),
+            AuthPosture::InsecureOverride
+        );
+        assert_eq!(check_auth_posture(false, "127.0.0.1:7777", None), AuthPosture::Ok);
+        assert_eq!(check_auth_posture(true, "0.0.0.0:7777", None), AuthPosture::Ok);
     }
-}
-
-// ─── /migrate-envelope HTTP handler ─────────────────────────────────
-//
-// Upgrade an existing v1 or v2 envelope to v3 without ever touching
-// the plaintext private key. Backend posts the OLD envelope blob and
-// the user's newly-enrolled auth methods (Passkey / OIDC); the enclave
-// decrypts the old envelope, re-seals under v3 with a fresh DEK, and
-// returns the new blob.
-
-/// JSON body backend posts to POST /migrate-envelope.
-#[derive(Debug, Deserialize)]
-struct MigrateBody {
-    /// CMK ARN for the active mode.
-    kms_key_arn: String,
-    /// The existing envelope blob — `enc:v1:...` or `enc:v2:...`.
-    old_envelope_blob: String,
-    /// Required if `old_envelope_blob` is v2 — proves migration is
-    /// user-authorised. The enclave's GCM tag check fails on a wrong
-    /// password and surfaces as a generic "invalid credentials" error.
-    #[serde(default)]
-    old_password: Option<String>,
-    /// Enrolled auth methods for the new v3 envelope. Must be non-empty.
-    enrolled_methods: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct MigrateSuccess {
-    envelope_blob: String,
-    owner_address: String,
-}
-
-async fn migrate_envelope_handler(
-    State(state): State<AppState>,
-    Json(body): Json<MigrateBody>,
-) -> Result<Json<MigrateSuccess>, (StatusCode, Json<SignError>)> {
-    #[cfg(target_os = "linux")]
-    {
-        if body.enrolled_methods.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(SignError {
-                    error: "enrolled_methods must be non-empty".to_string(),
-                }),
-            ));
-        }
-        let enclave_req = serde_json::json!({
-            "kms_key_arn": body.kms_key_arn,
-            "old_envelope_blob": body.old_envelope_blob,
-            "old_password": body.old_password,
-            "enrolled_methods": body.enrolled_methods,
-        });
-
-        match forward_to_enclave(
-            state.enclave_cid,
-            state.enclave_migrate_port,
-            &enclave_req,
-        )
-        .await
-        {
-            Ok(resp) => {
-                if let Some(ok) = resp.get("Ok") {
-                    let envelope_blob = ok
-                        .get("envelope_blob")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let owner_address = ok
-                        .get("owner_address")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if envelope_blob.is_empty() || owner_address.is_empty() {
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            Json(SignError {
-                                error: format!("malformed enclave response: {resp}"),
-                            }),
-                        ));
-                    }
-                    Ok(Json(MigrateSuccess {
-                        envelope_blob,
-                        owner_address,
-                    }))
-                } else if let Some(err) = resp
-                    .get("Err")
-                    .and_then(|e| e.get("reason"))
-                    .and_then(|s| s.as_str())
-                {
-                    warn!(reason = %err, "enclave migrate-envelope returned error");
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("enclave: {err}"),
-                        }),
-                    ))
-                } else {
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("malformed enclave response: {resp}"),
-                        }),
-                    ))
-                }
-            }
-            Err(e) => {
-                error!(error = ?e, "forward to enclave (migrate-envelope) failed");
-                Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(SignError {
-                        error: format!("forward to enclave: {e:#}"),
-                    }),
-                ))
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (state, body);
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SignError {
-                error: "parent proxy only runs on Linux".to_string(),
-            }),
-        ))
-    }
-}
-
-// ─── /reseal-v3 (append/remove enrolled_methods on a v3 envelope) ───
-//
-// Backend calls this to add a passkey (from a new device) or link an
-// OIDC provider to an existing v3 envelope. The consent gate is an
-// `auth_proof` produced by a method ALREADY inside the envelope —
-// the enclave's `verify_auth_proof` runs on the current methods list
-// after unwrap. Duplicate methods are rejected. Same EOA private key
-// on the way out; only the sealed methods list + wrapped DEK change.
-//
-// See enclave/src/vsock_server.rs::process_reseal_v3 for the enclave
-// side of this HTTP call.
-
-/// JSON body backend posts to POST /reseal-v3.
-#[derive(Debug, Deserialize)]
-struct ResealBody {
-    /// CMK ARN for the active mode.
-    kms_key_arn: String,
-    /// The existing v3 envelope blob (`enc:v3:...`).
-    old_envelope_blob: String,
-    /// Consent proof from a method that's currently in the envelope.
-    /// Shape mirrors `protocol::AuthProof` (Oidc or Passkey).
-    auth_proof: serde_json::Value,
-    /// The 32-byte challenge (hex) that `auth_proof` was signed
-    /// against. For passkey: `clientDataJSON.challenge` after b64url
-    /// decode. For OIDC: `id_token.nonce`. Backend generates the
-    /// challenge with a short TTL so replays are ineffective.
-    prehashed_hex: String,
-    /// The method to append to the enrolled_methods list. Enclave
-    /// refuses if this would duplicate an existing entry (by (iss, sub)
-    /// for OIDC, by cred_id for passkey).
-    new_method: serde_json::Value,
-
-    // ─── Option C: per-project signed accept-list bundle ────────────
-    // Optional. Same wire shape as SignBody — see the comment there
-    // for why these are forwarded. Reseal path uses the SAME
-    // verify_auth_proof code as sign, so without these fields any
-    // partner user (e.g. Blockfinax) trying to add a method fails
-    // with "origin/aud not in pinned accept list" for their
-    // WebAuthn assertion or Google id_token.
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    signed_config_json: Option<String>,
-    #[serde(default)]
-    signed_config_signature_b64: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResealSuccess {
-    envelope_blob: String,
-    owner_address: String,
-}
-
-async fn reseal_v3_handler(
-    State(state): State<AppState>,
-    Json(body): Json<ResealBody>,
-) -> Result<Json<ResealSuccess>, (StatusCode, Json<SignError>)> {
-    #[cfg(target_os = "linux")]
-    {
-        // Lightweight sanity check before we bother the enclave. Real
-        // v3 validation happens inside the enclave; this only catches
-        // the obviously-broken calls (client bug, not adversarial
-        // input we care about).
-        if !body.old_envelope_blob.starts_with("enc:v3:") {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(SignError {
-                    error: "old_envelope_blob must start with enc:v3:".to_string(),
-                }),
-            ));
-        }
-        if body.prehashed_hex.trim_start_matches("0x").len() != 64 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(SignError {
-                    error: "prehashed_hex must be 32 bytes (64 hex chars)".to_string(),
-                }),
-            ));
-        }
-
-        let enclave_req = serde_json::json!({
-            "kms_key_arn": body.kms_key_arn,
-            "old_envelope_blob": body.old_envelope_blob,
-            "auth_proof": body.auth_proof,
-            "prehashed_hex": body.prehashed_hex,
-            "new_method": body.new_method,
-            // Option C — same as sign_handler. Without these forwarded,
-            // reseal-v3 (add-passkey / link-google) fails for any
-            // partner project whose users' assertions don't match the
-            // hardcoded Rift-only default accept list.
-            "project_id": body.project_id,
-            "signed_config_json": body.signed_config_json,
-            "signed_config_signature_b64": body.signed_config_signature_b64,
-        });
-
-        match forward_to_enclave(
-            state.enclave_cid,
-            state.enclave_reseal_port,
-            &enclave_req,
-        )
-        .await
-        {
-            Ok(resp) => {
-                if let Some(ok) = resp.get("Ok") {
-                    let envelope_blob = ok
-                        .get("envelope_blob")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let owner_address = ok
-                        .get("owner_address")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if envelope_blob.is_empty() || owner_address.is_empty() {
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            Json(SignError {
-                                error: format!("malformed enclave response: {resp}"),
-                            }),
-                        ));
-                    }
-                    Ok(Json(ResealSuccess {
-                        envelope_blob,
-                        owner_address,
-                    }))
-                } else if let Some(err) = resp
-                    .get("Err")
-                    .and_then(|e| e.get("reason"))
-                    .and_then(|s| s.as_str())
-                {
-                    warn!(reason = %err, "enclave reseal-v3 returned error");
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("enclave: {err}"),
-                        }),
-                    ))
-                } else {
-                    Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(SignError {
-                            error: format!("malformed enclave response: {resp}"),
-                        }),
-                    ))
-                }
-            }
-            Err(e) => {
-                error!(error = ?e, "forward to enclave (reseal-v3) failed");
-                Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(SignError {
-                        error: format!("forward to enclave: {e:#}"),
-                    }),
-                ))
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (state, body);
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SignError {
-                error: "parent proxy only runs on Linux".to_string(),
-            }),
-        ))
-    }
-}
-
-// ─── vsock KMS proxy ────────────────────────────────────────────────
-//
-// Phase 2: requests carry an `op` discriminator. Two ops today:
-//   - "Decrypt"        — kms:Decrypt with attestation Recipient
-//   - "GenerateDataKey" — kms:GenerateDataKey with attestation Recipient
-
-/// Same shape as enclave's `protocol::KmsDecryptRequest`.
-#[derive(Deserialize)]
-struct KmsDecryptRequest {
-    attestation_doc_b64: String,
-    wrapped_dek_b64: String,
-    kms_key_arn: String,
-}
-
-#[derive(Deserialize)]
-struct KmsGenerateDataKeyRequest {
-    attestation_doc_b64: String,
-    kms_key_arn: String,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "op")]
-enum KmsProxyRequest {
-    Decrypt(KmsDecryptRequest),
-    GenerateDataKey(KmsGenerateDataKeyRequest),
-}
-
-// Response variants. Wire shape matches the enclave's
-// `enum KmsDecryptResponse` / `enum KmsGenerateDataKeyResponse`
-// (serde default for unit-tagged enums: `{ "Ok": {...} }` / `{ "Err": {...} }`).
-#[derive(Serialize)]
-#[serde(untagged)]
-enum KmsDecryptResponse {
-    Ok {
-        #[serde(rename = "Ok")]
-        ok: KmsDecryptOk,
-    },
-    Err {
-        #[serde(rename = "Err")]
-        err: KmsErr,
-    },
-}
-
-#[derive(Serialize)]
-struct KmsDecryptOk {
-    ciphertext_for_recipient_b64: String,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum KmsGenerateDataKeyResponse {
-    Ok {
-        #[serde(rename = "Ok")]
-        ok: KmsGenerateDataKeyOk,
-    },
-    Err {
-        #[serde(rename = "Err")]
-        err: KmsErr,
-    },
-}
-
-#[derive(Serialize)]
-struct KmsGenerateDataKeyOk {
-    ciphertext_blob_b64: String,
-    ciphertext_for_recipient_b64: String,
-}
-
-#[derive(Serialize)]
-struct KmsErr {
-    reason: String,
-}
-
-#[cfg(target_os = "linux")]
-async fn run_kms_proxy(port: u32, kms: Arc<KmsClient>) -> Result<()> {
-    let addr = VsockAddr::new(u32::MAX, port);
-    let mut listener = VsockListener::bind(addr).context("vsock bind for KMS proxy")?;
-    info!(port, "KMS proxy listener ready on vsock");
-    loop {
-        let (stream, peer) = listener.accept().await.context("vsock accept")?;
-        let kms = kms.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_kms_proxy_conn(stream, kms).await {
-                warn!(peer_cid = peer.cid(), error = ?e, "KMS proxy conn handler aborted");
-            }
-        });
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn handle_kms_proxy_conn(mut stream: VsockStream, kms: Arc<KmsClient>) -> Result<()> {
-    let req_bytes = read_frame(&mut stream).await?;
-    let req: KmsProxyRequest = serde_json::from_slice(&req_bytes)?;
-
-    let body = match req {
-        KmsProxyRequest::Decrypt(req) => {
-            let response = match call_kms_decrypt(&kms, &req).await {
-                Ok(ciphertext_for_recipient) => KmsDecryptResponse::Ok {
-                    ok: KmsDecryptOk {
-                        ciphertext_for_recipient_b64: B64.encode(&ciphertext_for_recipient),
-                    },
-                },
-                Err(e) => KmsDecryptResponse::Err {
-                    err: KmsErr {
-                        reason: format!("{e:#}"),
-                    },
-                },
-            };
-            serde_json::to_vec(&response)?
-        }
-        KmsProxyRequest::GenerateDataKey(req) => {
-            let response = match call_kms_generate_data_key(&kms, &req).await {
-                Ok((blob, cfr)) => KmsGenerateDataKeyResponse::Ok {
-                    ok: KmsGenerateDataKeyOk {
-                        ciphertext_blob_b64: B64.encode(&blob),
-                        ciphertext_for_recipient_b64: B64.encode(&cfr),
-                    },
-                },
-                Err(e) => KmsGenerateDataKeyResponse::Err {
-                    err: KmsErr {
-                        reason: format!("{e:#}"),
-                    },
-                },
-            };
-            serde_json::to_vec(&response)?
-        }
-    };
-
-    write_frame(&mut stream, &body).await?;
-    Ok(())
-}
-
-async fn call_kms_decrypt(kms: &KmsClient, req: &KmsDecryptRequest) -> Result<Vec<u8>> {
-    let attestation_doc = B64
-        .decode(&req.attestation_doc_b64)
-        .context("base64-decode attestation document")?;
-    let wrapped_dek = B64
-        .decode(&req.wrapped_dek_b64)
-        .context("base64-decode wrapped DEK")?;
-
-    let recipient = RecipientInfo::builder()
-        .attestation_document(Blob::new(attestation_doc))
-        .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
-        .build();
-
-    let out = kms
-        .decrypt()
-        .ciphertext_blob(Blob::new(wrapped_dek))
-        .key_id(&req.kms_key_arn)
-        .recipient(recipient)
-        .send()
-        .await
-        .context("KMS Decrypt with Recipient")?;
-
-    let cfr = out
-        .ciphertext_for_recipient
-        .ok_or_else(|| anyhow!("KMS returned no CiphertextForRecipient — was attestation valid?"))?;
-    Ok(cfr.into_inner())
-}
-
-/// Calls kms:GenerateDataKey with the recipient attestation. Returns
-/// (CiphertextBlob, CiphertextForRecipient).
-async fn call_kms_generate_data_key(
-    kms: &KmsClient,
-    req: &KmsGenerateDataKeyRequest,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let attestation_doc = B64
-        .decode(&req.attestation_doc_b64)
-        .context("base64-decode attestation document")?;
-
-    let recipient = RecipientInfo::builder()
-        .attestation_document(Blob::new(attestation_doc))
-        .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
-        .build();
-
-    let out = kms
-        .generate_data_key()
-        .key_id(&req.kms_key_arn)
-        .key_spec(aws_sdk_kms::types::DataKeySpec::Aes256)
-        .recipient(recipient)
-        .send()
-        .await
-        .context("KMS GenerateDataKey with Recipient")?;
-
-    let blob = out
-        .ciphertext_blob
-        .ok_or_else(|| anyhow!("KMS returned no CiphertextBlob"))?
-        .into_inner();
-    let cfr = out
-        .ciphertext_for_recipient
-        .ok_or_else(|| anyhow!("KMS returned no CiphertextForRecipient — was attestation valid?"))?
-        .into_inner();
-    Ok((blob, cfr))
-}
-
-// ─── Vsock framing helpers ──────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-async fn read_frame(stream: &mut VsockStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await.context("read length prefix")?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 1 << 20 {
-        bail!("frame too large: {len} bytes (max 1 MiB)");
-    }
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await.context("read frame body")?;
-    Ok(body)
-}
-
-#[cfg(target_os = "linux")]
-async fn write_frame(stream: &mut VsockStream, body: &[u8]) -> Result<()> {
-    let len = (body.len() as u32).to_be_bytes();
-    stream.write_all(&len).await.context("write length prefix")?;
-    stream.write_all(body).await.context("write frame body")?;
-    stream.flush().await.context("flush")?;
-    Ok(())
 }

@@ -298,6 +298,111 @@ The point: the plaintext secp256k1 private key exists only on the
 enclave's stack for the duration of step 10. It never crosses any
 vsock boundary, never goes to KMS, never leaves the TEE.
 
+## Bound reseal challenge (`rift-reseal-v1`) — client implementation
+
+`POST /reseal-v3` appends an auth method (a new passkey, or a linked
+Google / Apple identity) to an existing v3 wallet. Consent is an
+`auth_proof` from a method that is *already* enrolled.
+
+**Legacy behaviour (being retired):** the proof was over the raw
+32-byte `prehashed_hex` the backend handed out. The enclave cannot tell
+where those 32 bytes came from, so any proof the user ever produced over
+any 32-byte value — including an ordinary *transaction* proof, whose
+challenge is a UserOp hash — could be replayed by whoever controls the
+backend or parent host to enrol an attacker's passkey.
+
+**Bound mode:** the client signs a challenge that the enclave derives
+itself, binding the proof to *this* wallet, *this* one-shot server
+nonce and *this* new method:
+
+```text
+challenge = SHA-256(
+    "rift-reseal-v1"     14 bytes, ASCII, no terminator
+ || 0x00                 1 byte
+ || owner_address        20 raw bytes (the wallet's EOA address, NOT hex text)
+ || server_nonce         32 raw bytes = hex-decode(challengeHex from
+                         POST /wallet/methods/challenge) — the same value
+                         the backend forwards as `prehashed_hex`
+ || canonical(new_method)
+)
+
+canonical(new_method):
+  OIDC    : 0x01 || u32be(len(iss)) || iss (UTF-8) || u32be(len(sub)) || sub (UTF-8)
+  Passkey : 0x02 || u32be(len(cred_id)) || cred_id || u32be(len(cose)) || cose
+            where cred_id = base64-decode(new_method.cred_id_b64)
+                  cose    = base64-decode(new_method.cose_pubkey_b64)
+            (decoded bytes — padding / alphabet differences don't matter)
+```
+
+`u32be` is a 4-byte big-endian length. `new_method` must be byte-for-byte
+the method the client then sends in the request (same `iss`/`sub`
+strings, same credential bytes).
+
+How the challenge is used:
+
+| Proof kind | What to put in the ceremony |
+|---|---|
+| Passkey (`navigator.credentials.get`) | `challenge` = the 32 raw challenge bytes (clientDataJSON.challenge is then their base64url) |
+| OIDC (Google / Apple) | `nonce` = lowercase hex of the 32 challenge bytes (64 chars, no `0x`) |
+
+Request shape is unchanged: the client/backend still sends
+`prehashed_hex = <server_nonce hex>` — the enclave recomputes the bound
+challenge from it and never treats it as the challenge itself.
+
+Test vectors (also asserted in `enclave/src/reseal_helpers.rs`):
+
+```text
+owner_address = 00112233445566778899aabbccddeeff00112233
+server_nonce  = ab × 32
+OIDC  {iss: "https://accounts.google.com", sub: "1234567890"}
+  canonical = 010000001b68747470733a2f2f6163636f756e74732e676f6f676c652e636f6d0000000a31323334353637383930
+  challenge = 377f6d645f6d470848bad62021c2c318e7da4ad82139f00f05b18a6ac43355cb
+Passkey {cred_id: 01020304, cose: a50102}
+  canonical = 02000000040102030400000003a50102
+  challenge = 5b812e4547e39fba673c5e3b9f30a68f0e454c89e8ba179e240afc0365c4dadd
+```
+
+TypeScript sketch:
+
+```ts
+const enc = new TextEncoder();
+const u32 = (n: number) => new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+const lv = (b: Uint8Array) => concat(u32(b.length), b);
+const canonical = m.kind === "oidc"
+  ? concat(Uint8Array.of(1), lv(enc.encode(m.iss)), lv(enc.encode(m.sub)))
+  : concat(Uint8Array.of(2), lv(b64decode(m.cred_id_b64)), lv(b64decode(m.cose_pubkey_b64)));
+const challenge = new Uint8Array(await crypto.subtle.digest("SHA-256",
+  concat(enc.encode("rift-reseal-v1"), Uint8Array.of(0), hexToBytes(ownerAddress), hexToBytes(challengeHex), canonical)));
+```
+
+Rollout / enforcement: the enclave accepts bound proofs immediately and
+keeps accepting legacy proofs until either (a) a project's signed config
+bundle sets `"require_bound_reseal": true` (per project, no rebuild), or
+(b) `RESEAL_REQUIRE_BOUND_CHALLENGE` in `enclave/src/reseal_helpers.rs`
+is flipped to `true` (all projects; rebuild → new PCR0). Legacy accepts
+are logged as a warning inside the enclave.
+
+WebAuthn `signCount` is **not** checked on reseal (or sign): the
+enclave is stateless and the sealed envelope stores no per-credential
+counter. Storing one would not help — the backend can always present an
+older envelope blob — and synced platform passkeys report a constant 0.
+Replay protection comes from the one-shot server nonce plus the binding
+above.
+
+## WebAuthn origin policy
+
+The compiled-in (default) policy accepts only the `https://` Rift hosts
+listed in `enclave/src/webauthn_verification.rs`, RP-IDs `riftfi.xyz` /
+`riftfi.com`. `localhost` and `http://localhost:3000` are present only
+when the enclave crate is built with `--features dev-localhost`, which
+the Dockerfile never does.
+
+Cross-origin ceremonies (`clientDataJSON.crossOrigin == true`, i.e. the
+passkey prompt ran inside an iframe) and any `topOrigin` member are
+**rejected** unless a project's signed config lists the embedding page
+in `accepted_top_origins` — then the assertion needs `crossOrigin: true`
+AND a `topOrigin` that is exactly one of those values.
+
 ## Local development (Mac or Windows)
 
 The portable modules compile and run their unit tests on any

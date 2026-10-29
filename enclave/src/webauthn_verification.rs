@@ -61,6 +61,15 @@ pub struct WebAuthnPolicy {
     /// Same Cow trick as `accepted_rp_ids`.
     pub accepted_origins: RpList,
 
+    /// Top-level origins under which a CROSS-ORIGIN (iframe) assertion
+    /// is acceptable. Empty (the production default) means any
+    /// assertion with `crossOrigin: true` or a `topOrigin` member is
+    /// rejected. A per-project signed bundle can opt in by listing the
+    /// exact embedding pages (`accepted_top_origins`); then an assertion
+    /// is accepted only if `crossOrigin` is true AND `topOrigin` is
+    /// present AND listed here.
+    pub accepted_top_origins: RpList,
+
     /// If true, also require the UV (user verified) flag — meaning the
     /// authenticator confirmed presence + identity (biometric or PIN),
     /// not just touch. Most modern platforms always set UV; setting
@@ -92,12 +101,59 @@ impl RpList {
     }
 }
 
+/// Production RP-IDs (see `WebAuthnPolicy::default_prod`).
+#[cfg(not(feature = "dev-localhost"))]
+const DEFAULT_RP_IDS: &[&str] = &["riftfi.xyz", "riftfi.com"];
+#[cfg(feature = "dev-localhost")]
+const DEFAULT_RP_IDS: &[&str] = &["riftfi.xyz", "riftfi.com", "localhost"];
+
+/// Production origins (see `WebAuthnPolicy::default_prod`).
+#[cfg(not(feature = "dev-localhost"))]
+const DEFAULT_ORIGINS: &[&str] = &[
+    // Non-custodial sandbox — wallet + widget domains.
+    "https://wallet.sandbox.riftfi.com",
+    "https://widget.sandbox.riftfi.com",
+    // Prod wallet hosts (pre-added so the sandbox → prod promotion
+    // doesn't need another EIF rebuild + KMS reattestation cycle just
+    // for origin plumbing).
+    "https://wallet.riftfi.com",
+    "https://wallet.riftfi.xyz",
+    // Legacy sandbox landing hosts.
+    "https://sandbox.riftfi.xyz",
+    "https://sandbox.riftfi.com",
+    // Prod-shape hostnames (referenced by tests / older deployments).
+    "https://app.riftfi.xyz",
+    "https://app.riftfi.com",
+    "https://dashboard.riftfi.xyz",
+];
+/// Dev-only build (`--features dev-localhost`): production list plus
+/// the local Next.js dev server. NEVER used for an EIF.
+#[cfg(feature = "dev-localhost")]
+const DEFAULT_ORIGINS: &[&str] = &[
+    "https://wallet.sandbox.riftfi.com",
+    "https://widget.sandbox.riftfi.com",
+    "https://wallet.riftfi.com",
+    "https://wallet.riftfi.xyz",
+    "https://sandbox.riftfi.xyz",
+    "https://sandbox.riftfi.com",
+    "https://app.riftfi.xyz",
+    "https://app.riftfi.com",
+    "https://dashboard.riftfi.xyz",
+    "http://localhost:3000",
+];
+
 impl WebAuthnPolicy {
-    /// Sandbox policy. RP-IDs cover the .xyz + .com eTLD+1s + localhost
-    /// for dev; origins enumerate every deployed frontend host we
+    /// Production policy, compiled into the EIF. RP-IDs cover the
+    /// `.xyz` and `.com` eTLD+1s; origins enumerate every deployed frontend host we
     /// actually receive WebAuthn assertions from. Update + rebuild EIF
-    /// when domains change — this list is compiled into the enclave
-    /// image, no runtime override.
+    /// when domains change — no runtime override except the Rift-signed
+    /// per-project bundle (`project_config`).
+    ///
+    /// `localhost` / `http://localhost:3000` are NOT in this list: a
+    /// production enclave must never accept an assertion minted for an
+    /// RP that any machine can claim. They are only added when the crate
+    /// is built with the non-default `dev-localhost` feature, which the
+    /// Dockerfile / Makefile EIF build never enables.
     ///
     /// Passkey assertions from any origin NOT in this list are rejected
     /// with "origin ... not in the pinned accept list" — a common cause
@@ -105,31 +161,10 @@ impl WebAuthnPolicy {
     /// is provisioned. If you see that, add the host here and rebuild.
     pub fn default_prod() -> Self {
         Self {
-            accepted_rp_ids: RpList::Static(&[
-                "riftfi.xyz",
-                "riftfi.com",
-                "localhost",
-            ]),
-            accepted_origins: RpList::Static(&[
-                // Non-custodial sandbox — wallet + widget domains.
-                "https://wallet.sandbox.riftfi.com",
-                "https://widget.sandbox.riftfi.com",
-                // Prod wallet hosts (pre-added so the sandbox → prod
-                // promotion doesn't need another EIF rebuild + KMS
-                // reattestation cycle just for origin plumbing).
-                "https://wallet.riftfi.com",
-                "https://wallet.riftfi.xyz",
-                // Legacy sandbox landing hosts.
-                "https://sandbox.riftfi.xyz",
-                "https://sandbox.riftfi.com",
-                // Prod-shape hostnames (referenced by tests / older
-                // deployments — keep to avoid regressions once the
-                // v3 sandbox promotes to prod).
-                "https://app.riftfi.xyz",
-                "https://app.riftfi.com",
-                "https://dashboard.riftfi.xyz",
-                "http://localhost:3000",
-            ]),
+            accepted_rp_ids: RpList::Static(DEFAULT_RP_IDS),
+            accepted_origins: RpList::Static(DEFAULT_ORIGINS),
+            // Cross-origin (iframe) assertions are rejected by default.
+            accepted_top_origins: RpList::Static(&[]),
             require_user_verified: true,
         }
     }
@@ -146,11 +181,13 @@ impl WebAuthnPolicy {
     pub fn from_owned(
         accepted_rp_ids: Vec<String>,
         accepted_origins: Vec<String>,
+        accepted_top_origins: Vec<String>,
         require_user_verified: bool,
     ) -> Self {
         Self {
             accepted_rp_ids: RpList::Owned(accepted_rp_ids),
             accepted_origins: RpList::Owned(accepted_origins),
+            accepted_top_origins: RpList::Owned(accepted_top_origins),
             require_user_verified,
         }
     }
@@ -247,6 +284,14 @@ struct ClientData {
     type_: String,
     challenge: String, // base64url-no-pad
     origin: String,
+    /// WebAuthn L2 §5.8.1: true when the ceremony ran in a cross-origin
+    /// iframe. Absent is equivalent to false.
+    #[serde(rename = "crossOrigin", default)]
+    cross_origin: Option<bool>,
+    /// WebAuthn L3: the top-level origin, only present for cross-origin
+    /// ceremonies.
+    #[serde(rename = "topOrigin", default)]
+    top_origin: Option<String>,
 }
 
 /// Bit positions of the flags byte inside authenticatorData.
@@ -299,6 +344,21 @@ pub fn verify_assertion(
     // storage. cd.origin is a String owned by the parsed ClientData.
     if !policy.accepted_origins.iter().any(|o| o == cd.origin.as_str()) {
         bail!("origin {} is not in the pinned accept list", cd.origin);
+    }
+
+    // Cross-origin (iframe) ceremonies: rejected unless the policy
+    // explicitly lists the embedding top-level origin. Without this a
+    // page on any site that iframes an accepted origin could drive the
+    // ceremony.
+    let cross_origin = cd.cross_origin.unwrap_or(false);
+    match (cross_origin, cd.top_origin.as_deref()) {
+        (false, None) => {}
+        (true, Some(top)) if policy.accepted_top_origins.iter().any(|o| o == top) => {}
+        (true, Some(top)) => {
+            bail!("cross-origin assertion: topOrigin {top} is not in the pinned accept list")
+        }
+        (true, None) => bail!("cross-origin assertion without topOrigin is not accepted"),
+        (false, Some(_)) => bail!("topOrigin present on a same-origin assertion"),
     }
 
     // ─── 2. Check authenticatorData ─────────────────────────────────
@@ -359,12 +419,6 @@ pub fn verify_assertion(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn debug_base64(bytes: &[u8]) -> String {
-    use base64::engine::general_purpose::STANDARD as B64;
-    B64.encode(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +428,7 @@ mod tests {
         WebAuthnPolicy {
             accepted_rp_ids: RpList::Static(&["test.riftfi.xyz"]),
             accepted_origins: RpList::Static(&["https://test.riftfi.xyz"]),
+            accepted_top_origins: RpList::Static(&[]),
             require_user_verified: true,
         }
     }
@@ -563,6 +618,7 @@ mod tests {
                 "https://sandbox.riftfi.com",
                 "http://localhost:3000",
             ]),
+            accepted_top_origins: RpList::Static(&[]),
             require_user_verified: true,
         };
 
@@ -596,5 +652,71 @@ mod tests {
         let (cose, cbor) = build_cose_pub(sk.verifying_key());
         let parsed = CoseP256PublicKey::from_cose_cbor(&cbor).unwrap();
         assert_eq!(parsed, cose);
+    }
+
+    /// Sign an arbitrary clientDataJSON value (for crossOrigin/topOrigin cases).
+    fn assertion_with_cd(sk: &P256Sk, rp_id: &str, cd: serde_json::Value) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let client_data_json = serde_json::to_vec(&cd).unwrap();
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        auth_data.push(FLAG_USER_PRESENT | FLAG_USER_VERIFIED);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data_json));
+        let sig: P256Sig = sk.sign(&signed);
+        (client_data_json, auth_data, sig.to_der().as_bytes().to_vec())
+    }
+
+    #[test]
+    fn cross_origin_and_top_origin_rules() {
+        let sk = P256Sk::random(&mut rand::thread_rng());
+        let (cose, _) = build_cose_pub(sk.verifying_key());
+        let ch = [0x33u8; 32];
+        let base = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "type": "webauthn.get",
+                "challenge": B64URL.encode(ch),
+                "origin": "https://test.riftfi.xyz",
+            });
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            v
+        };
+        let run = |policy: &WebAuthnPolicy, extra: serde_json::Value| {
+            let (cd, ad, sig) = assertion_with_cd(&sk, "test.riftfi.xyz", base(extra));
+            verify_assertion(&cose, &cd, &ad, &sig, &ch, policy)
+        };
+        let strict = test_policy();
+        // crossOrigin:false explicit is fine.
+        run(&strict, serde_json::json!({"crossOrigin": false})).unwrap();
+        // crossOrigin:true rejected by default.
+        let e = run(&strict, serde_json::json!({"crossOrigin": true, "topOrigin": "https://evil.com"})).unwrap_err();
+        assert!(e.to_string().contains("topOrigin"), "{e:#}");
+        let e = run(&strict, serde_json::json!({"crossOrigin": true})).unwrap_err();
+        assert!(e.to_string().contains("cross-origin"), "{e:#}");
+        // topOrigin without crossOrigin rejected.
+        let e = run(&strict, serde_json::json!({"topOrigin": "https://test.riftfi.xyz"})).unwrap_err();
+        assert!(e.to_string().contains("topOrigin"), "{e:#}");
+        // Opt-in policy accepts only the listed embedding page.
+        let opt_in = WebAuthnPolicy {
+            accepted_rp_ids: RpList::Static(&["test.riftfi.xyz"]),
+            accepted_origins: RpList::Static(&["https://test.riftfi.xyz"]),
+            accepted_top_origins: RpList::Static(&["https://partner.example"]),
+            require_user_verified: true,
+        };
+        run(&opt_in, serde_json::json!({"crossOrigin": true, "topOrigin": "https://partner.example"})).unwrap();
+        assert!(run(&opt_in, serde_json::json!({"crossOrigin": true, "topOrigin": "https://evil.example"})).is_err());
+        assert!(run(&opt_in, serde_json::json!({"crossOrigin": true})).is_err());
+    }
+
+    #[cfg(not(feature = "dev-localhost"))]
+    #[test]
+    fn prod_policy_excludes_localhost() {
+        let p = WebAuthnPolicy::default_prod();
+        assert!(!p.accepted_rp_ids.iter().any(|r| r == "localhost"));
+        assert!(!p.accepted_origins.iter().any(|o| o.contains("localhost")));
+        assert!(p.accepted_origins.iter().all(|o| o.starts_with("https://")));
+        assert_eq!(p.accepted_top_origins.iter().count(), 0);
     }
 }

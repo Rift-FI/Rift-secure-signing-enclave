@@ -26,6 +26,7 @@ help:
 	@echo "  make pcr0                    # print the EIF's PCR0 (use in KMS key policy)"
 	@echo "  make run-debug               # launch enclave in debug-mode"
 	@echo "  make run                     # launch enclave in production mode"
+	@echo "  make run-eif                 # launch the EIF on disk (no rebuild)"
 	@echo "  make describe                # show running enclaves"
 	@echo "  make console                 # tail enclave console output"
 	@echo "  make kill                    # terminate all running enclaves"
@@ -42,11 +43,11 @@ test:
 
 .PHONY: build-enclave
 build-enclave:
-	cargo build --release --bin rift-signer-enclave
+	cargo build --locked --release --bin rift-signer-enclave
 
 .PHONY: build-parent-proxy
 build-parent-proxy:
-	cargo build --release --bin rift-parent-proxy
+	cargo build --locked --release --bin rift-parent-proxy
 
 .PHONY: build
 build: build-enclave build-parent-proxy
@@ -103,6 +104,20 @@ run: eif
 	  --cpu-count $(ENCLAVE_CPUS) \
 	  --enclave-cid $(ENCLAVE_CID)
 
+# Same as `run` but WITHOUT rebuilding: launches the EIF already on
+# disk. Used by the rotation Lambda after it has verified that this
+# exact EIF's PCR0 equals the approved value — `run` would rebuild
+# the image first and could launch something other than what was
+# just verified.
+.PHONY: run-eif
+run-eif:
+	@test -f $(EIF) || { echo "$(EIF) missing — run make eif first" >&2; exit 1; }
+	sudo nitro-cli run-enclave \
+	  --eif-path $(EIF) \
+	  --memory $(ENCLAVE_MEMORY_MIB) \
+	  --cpu-count $(ENCLAVE_CPUS) \
+	  --enclave-cid $(ENCLAVE_CID)
+
 .PHONY: console
 console:
 	@ENCLAVE_ID=$$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveID'); \
@@ -125,10 +140,22 @@ kill:
 # ─── Parent-proxy systemd install ──────────────────────────────────
 # Builds the parent proxy and installs it as a systemd unit so it
 # survives reboots and restarts the smart-wallet sees timeouts cleanly.
+# The unit runs as the unprivileged system user $(PROXY_USER) (see the
+# comment block in systemd/rift-parent-proxy.service for why root is
+# not needed). Created here idempotently.
+PROXY_USER ?= rift-proxy
 .PHONY: install-parent-proxy
 install-parent-proxy: build-parent-proxy
-	sudo cp target/release/rift-parent-proxy /usr/local/bin/rift-parent-proxy
-	sudo cp systemd/rift-parent-proxy.service /etc/systemd/system/rift-parent-proxy.service
+	@if ! id -u $(PROXY_USER) >/dev/null 2>&1; then \
+	  echo "creating system user $(PROXY_USER)"; \
+	  sudo useradd --system --no-create-home --home-dir /nonexistent \
+	    --shell "$$(command -v nologin || echo /sbin/nologin)" $(PROXY_USER); \
+	fi
+	sudo install -o root -g root -m 0755 target/release/rift-parent-proxy /usr/local/bin/rift-parent-proxy
+	sudo install -o root -g root -m 0644 systemd/rift-parent-proxy.service /etc/systemd/system/rift-parent-proxy.service
+	@# The env file holds the bearer token: keep it root-only (systemd
+	@# reads it before dropping privileges to $(PROXY_USER)).
+	@if [ -f /etc/rift-parent-proxy.env ]; then sudo chown root:root /etc/rift-parent-proxy.env && sudo chmod 0600 /etc/rift-parent-proxy.env; fi
 	sudo systemctl daemon-reload
 	sudo systemctl enable --now rift-parent-proxy.service
 	@echo "✓ parent-proxy installed and running"

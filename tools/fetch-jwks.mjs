@@ -38,16 +38,31 @@ async function fetchJwks(url) {
   return json.keys;
 }
 
+// Every value below is interpolated into a Rust string literal that is
+// compiled INTO THE ENCLAVE. Anything outside the base64url alphabet
+// (e.g. a `"` or `\`) would let a malformed or tampered JWKS response
+// inject Rust code into the EIF, so refuse it outright. Real JWKS
+// `kid`/`n`/`e`/`x`/`y` values are always base64url or hex.
+const SAFE_FIELD = /^[A-Za-z0-9_-]{1,2048}$/;
+
+function safe(key, field) {
+  const v = key[field];
+  if (typeof v !== "string" || !SAFE_FIELD.test(v)) {
+    throw new Error(`refusing JWK field ${field}=${JSON.stringify(v)} (kid=${JSON.stringify(key.kid)}): not base64url`);
+  }
+  return v;
+}
+
 function rsToRustLiteral(key, iss) {
   // We only support RS256 RSA keys and ES256 P-256 EC keys.
   if (key.kty === "RSA" && key.alg === "RS256") {
     return `        PinnedJwk {
-            kid: "${key.kid}".to_string(),
+            kid: "${safe(key, "kid")}".to_string(),
             kty: "RSA".to_string(),
             alg: "RS256".to_string(),
             iss: "${iss}".to_string(),
-            n: Some("${key.n}".to_string()),
-            e: Some("${key.e}".to_string()),
+            n: Some("${safe(key, "n")}".to_string()),
+            e: Some("${safe(key, "e")}".to_string()),
             crv: None,
             x: None,
             y: None,
@@ -55,15 +70,15 @@ function rsToRustLiteral(key, iss) {
   }
   if (key.kty === "EC" && key.alg === "ES256" && key.crv === "P-256") {
     return `        PinnedJwk {
-            kid: "${key.kid}".to_string(),
+            kid: "${safe(key, "kid")}".to_string(),
             kty: "EC".to_string(),
             alg: "ES256".to_string(),
             iss: "${iss}".to_string(),
             n: None,
             e: None,
             crv: Some("P-256".to_string()),
-            x: Some("${key.x}".to_string()),
-            y: Some("${key.y}".to_string()),
+            x: Some("${safe(key, "x")}".to_string()),
+            y: Some("${safe(key, "y")}".to_string()),
         }`;
   }
   // Skip unsupported algorithms — the enclave verify whitelist would
@@ -86,6 +101,14 @@ async function main() {
     fetchJwks(GOOGLE_JWKS_URL),
     fetchJwks(APPLE_JWKS_URL),
   ]);
+
+  // An empty Google key set would compile to `vec![]` and make every
+  // Google OIDC sign fail after the next rotation. Fail the rotation
+  // instead so the currently-deployed EIF keeps serving.
+  const googleSupported = googleKeys.filter((k) => rsToRustLiteral(k, GOOGLE_ISS) !== null);
+  if (googleSupported.length === 0) {
+    throw new Error("Google JWKS yielded no supported RS256 keys; refusing to emit an empty key set");
+  }
 
   const now = new Date().toISOString();
   const out = [

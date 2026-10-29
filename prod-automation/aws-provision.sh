@@ -35,6 +35,12 @@
 #   KEY_NAME           optional: EC2 KeyPair for emergency ssh. Not needed
 #                      if you only ever use SSM Session Manager.
 #   SUBNET_ID          optional: launch subnet. Default: default subnet.
+#   ENCLAVE_REF        git commit SHA (preferred) or release tag of the
+#                      signer repo whose ec2-bootstrap.sh the printed
+#                      next-steps fetch and build. Required: the bootstrap
+#                      is no longer fetched from a moving branch.
+#   ENCLAVE_RAW_BASE   raw-content base URL of the signer repo
+#                      (default: https://raw.githubusercontent.com/Rift-FI/Rift-secure-signing-enclave)
 
 set -Eeuo pipefail
 
@@ -44,6 +50,8 @@ INSTANCE_TYPE="${INSTANCE_TYPE:-c6g.large}"
 AMI_SSM_PARAM="${AMI_SSM_PARAM:-/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}"
 KEY_NAME="${KEY_NAME:-}"
 SUBNET_ID="${SUBNET_ID:-}"
+ENCLAVE_REF="${ENCLAVE_REF:-}"
+ENCLAVE_RAW_BASE="${ENCLAVE_RAW_BASE:-https://raw.githubusercontent.com/Rift-FI/Rift-secure-signing-enclave}"
 
 case "$ENV_TAG" in
   sandbox|prod) ;;
@@ -56,6 +64,12 @@ die()  { printf '\033[31m[fatal]\033[0m %s\n' "$*" >&2; exit 1; }
 step() { echo; printf '\033[35m━━━ %s ━━━\033[0m\n' "$*"; }
 
 export AWS_PAGER=""
+
+# Fail early (before creating anything) if the bootstrap ref is unpinned.
+[[ -n "$ENCLAVE_REF" ]] || die "set ENCLAVE_REF to the signer commit SHA (or release tag) to bootstrap — never a branch"
+case "$ENCLAVE_REF" in
+  main|master|HEAD) die "ENCLAVE_REF=$ENCLAVE_REF is a moving ref; pin a commit SHA or release tag" ;;
+esac
 
 command -v aws >/dev/null || die "aws cli not installed"
 aws sts get-caller-identity >/dev/null || die "aws cli not configured / no creds"
@@ -209,11 +223,13 @@ next steps:
   # A. wait ~60s for SSM agent to register, then jump into the box
   aws ssm start-session --target $INSTANCE_ID --region $AWS_REGION
 
-  # B. once inside, curl this bootstrap and run it
-  curl -sSf https://raw.githubusercontent.com/Rift-FI/rift-signer-enclave/main/prod-automation/ec2-bootstrap.sh \\
-    -o /tmp/bootstrap.sh
-  ENV_TAG=$ENV_TAG bash /tmp/bootstrap.sh
-  # (or scp this file over via SSM if you don't want to publish it yet)
+  # B. once inside, fetch the bootstrap AT THE PINNED REF, review it,
+  #    then run it with the same ref (it builds exactly that commit).
+  BOOT=\$(mktemp -d)/ec2-bootstrap.sh
+  curl -sSf --proto '=https' "$ENCLAVE_RAW_BASE/$ENCLAVE_REF/prod-automation/ec2-bootstrap.sh" -o "\$BOOT"
+  less "\$BOOT"     # review before running
+  ENV_TAG=$ENV_TAG ENCLAVE_REF=$ENCLAVE_REF bash "\$BOOT"
+  # (or copy the file over via SSM if you don't want to publish it yet)
 
   # C. copy the PCR0 it prints, then tighten the KMS key policy
   #    (PROD-SETUP.md step 5).

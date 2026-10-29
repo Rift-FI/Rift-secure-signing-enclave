@@ -19,7 +19,8 @@ You'll do everything below as the EC2 user via SSM Session Manager — no SSH, n
 ## 1 — Build the enclave EIF + capture PCR0
 
 ```sh
-# Once: install Rust on the EC2 (rust-toolchain.toml auto-installs 1.83.0)
+# Once: install Rust on the EC2 (rust-toolchain.toml auto-installs 1.92.0,
+# the same version the Dockerfile's rust:1.92.0-bookworm builder uses)
 sudo dnf install -y git jq
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 . "$HOME/.cargo/env"
@@ -52,7 +53,22 @@ make install-parent-proxy
 sudo systemctl status rift-parent-proxy --no-pager | head -8
 ```
 
-You should see `active (running)`. The proxy is listening on `127.0.0.1:7777` for HTTP signing requests and on vsock port 5006 for KMS proxy callbacks. It won't have anything to forward to until the enclave is running (step 4).
+You should see `active (running)`. The proxy is listening on `HTTP_BIND` (default **`0.0.0.0:7777`**, i.e. all interfaces) for HTTP signing requests and on vsock port 5006 for KMS proxy callbacks. It won't have anything to forward to until the enclave is running (step 4).
+
+> **Auth (fail closed):** the proxy **refuses to start** when `HTTP_BIND` is not a loopback address and `PARENT_PROXY_AUTH_TOKEN` is unset. Put the token in `/etc/rift-parent-proxy.env` (root:root 0600) **before** `make install-parent-proxy` starts the unit, or bind `HTTP_BIND=127.0.0.1:7777`. For a throwaway dev box only, `PARENT_PROXY_ALLOW_INSECURE=1` overrides the check; the proxy then logs an `INSECURE` error line on every start. With a token set, every enclave route (`/sign`, `/generate-wallet`, `/migrate-envelope`, `/reseal-v3`, `/health/enclave`) requires `Authorization: Bearer <token>`; `/health` stays open.
+>
+> ```sh
+> sudo install -o root -g root -m 0600 /dev/null /etc/rift-parent-proxy.env
+> echo "PARENT_PROXY_AUTH_TOKEN=$(openssl rand -hex 32)" | sudo tee -a /etc/rift-parent-proxy.env >/dev/null
+> ```
+>
+> **Runs as `rift-proxy`, not root.** `make install-parent-proxy` creates the `rift-proxy` system user (no shell, no home) and the unit sets `User=`/`Group=`. AF_VSOCK on ports ≥ 1024, TCP 7777 and IMDS credentials need no privileges; systemd reads the env file before dropping privileges. If you upgrade an existing host, re-run `make install-parent-proxy` so the user exists before the new unit starts.
+>
+> **Load limits (env, optional):** `PARENT_PROXY_MAX_CONCURRENCY` (default 4 enclave requests in flight across all routes), `PARENT_PROXY_QUEUE_TIMEOUT_MS` (default 10000; no slot within this → `503 {"error":"parent-proxy overloaded"}`), `PARENT_PROXY_REQUEST_TIMEOUT_SECS` (default 30 → `504 {"error":"enclave request timed out"}`). Request bodies over 1 MiB (the vsock frame cap) get `413`.
+>
+> **KMS proxy peer check:** the vsock KMS proxy (5006) serves only connections whose peer CID equals `ENCLAVE_CID`. Keep `ENCLAVE_CID` correct (`make run` pins 17) or the enclave's KMS calls are refused.
+>
+> **Enclave canary:** `GET /health/enclave` (bearer) round-trips vsock to the enclave's health port (5010, `ENCLAVE_HEALTH_PORT`) and returns `{"status":"ok","version":..,"pcr0":..,"kms_checked":false}` with the PCR0 the enclave reads from its NSM. `POST /health/enclave` with `{"kms_key_arn":"<key>"}` additionally runs an attested KMS GenerateDataKey + Decrypt round trip (`kms_checked: true`). Unlike `/health`, this proves the enclave is actually serving. Older enclave images don't listen on 5010 → 502.
 
 ---
 
@@ -115,9 +131,11 @@ make describe   # confirms it's running, gives you the EnclaveCID
 Note the `EnclaveCID` (e.g. `16`). Tell the parent-proxy about it via env file:
 
 ```sh
-sudo tee /etc/rift-parent-proxy.env >/dev/null <<EOF
-ENCLAVE_CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID')
-EOF
+# Update ENCLAVE_CID in place — do NOT overwrite the file, it holds
+# PARENT_PROXY_AUTH_TOKEN (the proxy will not start on 0.0.0.0 without it).
+CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID')
+sudo sed -i '/^ENCLAVE_CID=/d' /etc/rift-parent-proxy.env
+echo "ENCLAVE_CID=$CID" | sudo tee -a /etc/rift-parent-proxy.env >/dev/null
 sudo systemctl restart rift-parent-proxy
 sudo journalctl -u rift-parent-proxy -n 20 --no-pager
 ```
@@ -131,9 +149,18 @@ You should see `KMS proxy listener ready on vsock` and `HTTP listener ready`.
 From the same EC2 shell:
 
 ```sh
-# 5a — Health check the parent-proxy.
+# 5a — Health check the parent-proxy (process liveness only).
 curl -s http://127.0.0.1:7777/health
 # → "ok"
+
+# 5a' — Real enclave round trip: vsock → enclave → NSM PCR0, plus an
+#       attested KMS GenerateDataKey + Decrypt against the sandbox key.
+SANDBOX_ARN="arn:aws:kms:us-east-1:957814222213:key/a537dc0f-6010-4ab5-ac63-c1e5b313b640"
+TOKEN=$(sudo sed -n 's/^PARENT_PROXY_AUTH_TOKEN=//p' /etc/rift-parent-proxy.env)
+curl -s -X POST -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  --data "{\"kms_key_arn\":\"$SANDBOX_ARN\"}" http://127.0.0.1:7777/health/enclave
+# → {"status":"ok","version":"0.1.0","pcr0":"<same as make pcr0>","kms_checked":true}
+#   (pcr0 is all zeros in --debug-mode)
 
 # 5b — Encrypt a test plaintext via the SANDBOX KMS CMK + craft an envelope.
 PLAINTEXT_PK="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # known Hardhat dev key
@@ -310,17 +337,17 @@ Anything that changes the binary changes PCR0:
 - `rust-toolchain.toml`
 - `Cargo.lock`
 - Source code under `enclave/src/`
-- Docker base image (`debian:bookworm-slim`) — if you upgrade, PCR0 shifts
+- Docker base images (`rust:1.92.0-bookworm` builder, `debian:bookworm-slim` runtime) — referenced by tag, so a re-pushed tag shifts PCR0; pin by digest for fully reproducible builds
 - The Dockerfile itself
+- Compile-time switches in source: `envelope::V1_SIGNING_ENABLED`, `reseal_helpers::RESEAL_REQUIRE_BOUND_CHALLENGE`, the WebAuthn default policy, pinned JWKS
 
-**Standard rotation flow** when you ship a code change:
+**Standard rotation flow** when you ship a code change: approval-gated, see [prod-automation/README.md — Enclave release approval](prod-automation/README.md#enclave-release-approval). In short:
 
-1. `git pull && make eif`
-2. `make pcr0` → `PCR0_v2`
-3. KMS console → key policy → add a *second* statement granting Decrypt for `PCR0_v2` alongside the existing `PCR0_v1`.
-4. `make kill` (terminates old enclave) → `make run` (boots new image).
-5. Verify with smoke test (step 5).
-6. Once stable for 24h, edit key policy to remove the `PCR0_v1` statement.
+1. Review + merge the change. CI (or a release engineer) builds the EIF from the merged commit on a clean checkout and records its PCR0.
+2. An approver writes the commit SHA to `/rift/enclave/approved-commit` and the PCR0 to `/rift/enclave/approved-pcr0` (SSM).
+3. The rotation Lambda builds that exact commit on the EC2, refuses unless the PCR0 matches, adds it to both KMS policies, restarts the enclave from the verified EIF (`make run-eif`), runs the `/health/enclave` canary (PCR0 + attested KMS round trip) and only then removes the old PCR0.
+
+Manual equivalent: `make eif && make pcr0` → compare with the approved value → `update-kms-pcr0.sh --add` → `make kill && make run-eif` → `POST /health/enclave` → `update-kms-pcr0.sh --remove <old>`.
 
 This is the only "zero-downtime + rollback-safe" pattern for attested enclaves. Drop one PCR0 from the policy before adding the next and your KMS calls start failing the instant any in-flight request lands on the old image.
 

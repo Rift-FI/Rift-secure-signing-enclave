@@ -180,19 +180,35 @@ cd ~/rift/Rift-secure-signing-enclave
 sudo make run-debug
 sudo make describe               # note EnclaveCID
 
-# Point the parent-proxy at the enclave
+# Point the parent-proxy at the enclave. The env file MUST also carry a
+# bearer token: on the default 0.0.0.0:7777 bind the proxy refuses to
+# start without PARENT_PROXY_AUTH_TOKEN (fail closed).
 CID=$(sudo nitro-cli describe-enclaves | jq -r '.[0].EnclaveCID')
+TOKEN=$(openssl rand -hex 32)     # give the same value to your smart-wallet
+sudo install -o root -g root -m 0600 /dev/null /etc/rift-parent-proxy.env
 sudo tee /etc/rift-parent-proxy.env >/dev/null <<EOF
 ENCLAVE_CID=$CID
+PARENT_PROXY_AUTH_TOKEN=$TOKEN
 EOF
 sudo systemctl restart rift-parent-proxy
+sudo systemctl is-active rift-parent-proxy   # "failed" ⇒ journalctl -u rift-parent-proxy
 
-# Smoke test
+# Smoke test 1 — proxy process liveness only (does NOT reach the enclave)
 curl -s http://127.0.0.1:7777/health
 # → "ok"
+
+# Smoke test 2 — real vsock round trip into the enclave + attested KMS
+curl -s -X POST -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  --data "{\"kms_key_arn\":\"$KMS_KEY_ARN\"}" http://127.0.0.1:7777/health/enclave
+# → {"status":"ok","version":"…","pcr0":"…","kms_checked":true}
+#   pcr0 is all zeros in debug mode; in production mode it must equal your pinned PCR0.
 ```
 
-If `/health` returns `ok`, the enclave-vsock-parent-proxy chain works. Kill the debug enclave and start it in production mode:
+`/health` only proves the parent-proxy process is up. `/health/enclave` proves the enclave answers on vsock, reports which image it is (PCR0 from its NSM) and — with `kms_key_arn` — that your KMS key policy releases keys to it.
+
+Never overwrite `/etc/rift-parent-proxy.env` wholesale later (e.g. when the CID changes) — edit `ENCLAVE_CID` in place so the token survives. `HTTP_BIND=127.0.0.1:7777` is the alternative to a token when nothing off-host talks to the proxy. `PARENT_PROXY_ALLOW_INSECURE=1` disables the fail-closed check; use it only on a disposable dev box. The proxy runs as the unprivileged `rift-proxy` user created by `make install-parent-proxy`.
+
+Kill the debug enclave and start it in production mode:
 
 ```sh
 sudo make kill

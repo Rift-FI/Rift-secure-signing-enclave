@@ -70,6 +70,17 @@ pub fn attest(public_key: &[u8], nonce: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     .context("attestation document generation")
 }
 
+/// Read this enclave's own PCR0 from the NSM. Used by the health /
+/// canary port so rotation can confirm the image it just started is the
+/// approved one. All zeros in debug mode.
+pub fn describe_pcr0() -> Result<Vec<u8>> {
+    match nsm_driver::nsm_process_request(fd()?, NsmRequest::DescribePCR { index: 0 }) {
+        NsmResponse::DescribePCR { data, .. } => Ok(data),
+        NsmResponse::Error(e) => Err(anyhow!("NSM DescribePCR failed: {:?}", e)),
+        other => Err(anyhow!("unexpected NSM response: {:?}", other)),
+    }
+}
+
 /// Same as `attest` but also returns the document's embedded trusted
 /// timestamp as Unix seconds.
 ///

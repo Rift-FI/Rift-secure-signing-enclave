@@ -32,7 +32,7 @@
 //! a third-party IdP.
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
 use rsa::pkcs1v15::{Signature as RsaPkcs1Sig, VerifyingKey as RsaVerifyingKey};
 use rsa::signature::Verifier as _;
@@ -340,11 +340,6 @@ fn verify_es256(jwk: &PinnedJwk, signing_input: &[u8], signature: &[u8]) -> Resu
         .verify(signing_input, &sig)
         .map_err(|e| anyhow!("ES256 signature verification failed: {e}"))?;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn b64_for_test(bytes: &[u8]) -> String {
-    B64.encode(bytes)
 }
 
 #[cfg(test)]

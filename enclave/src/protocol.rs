@@ -8,7 +8,37 @@
 //! bytes max). One request → one response, both terminated by EOF on
 //! the socket if the peer wants to close the connection.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
+
+/// A user secret (password) received over the wire. Wiped on drop, and
+/// its `Debug` impl is redacted so a stray `{:?}` can never log it.
+/// Serialises as a plain JSON string — wire shape unchanged.
+pub struct SecretString(Zeroizing<String>);
+
+impl SecretString {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(SecretString(Zeroizing::new(String::deserialize(d)?)))
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
 
 /// Parent → Enclave: please sign this UserOperation hash using the
 /// EOA private key whose envelope we're handing you.
@@ -23,7 +53,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// The enclave picks the path by which set of fields is populated. If
 /// both are populated or both are empty, the request is rejected.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// Deliberately NOT `Debug`: carries the v2 password and the consent
+/// proof.
+#[derive(Serialize, Deserialize)]
 pub struct SignRequest {
     /// Hex (with or without 0x prefix), 32 bytes once decoded. The
     /// 32-byte hash the backend computed off-enclave (Safe UserOp hash
@@ -49,7 +82,7 @@ pub struct SignRequest {
     /// AES-GCM tag check fails and the enclave returns "invalid
     /// credentials" without leaking which factor was wrong.
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
 
     /// v2 only: the HKDF salt, base64-encoded. 32 bytes. Per-envelope
     /// random, generated at envelope-create time.
@@ -120,7 +153,8 @@ pub struct SignRequest {
 
 /// Tagged union of consent proofs accepted by v3 envelopes. The
 /// enclave dispatches on `kind` and verifies inline (no network).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// Not `Debug`: an id_token is a bearer credential until it expires.
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum AuthProof {
     /// Google or Apple id_token. The `nonce` claim MUST equal the
@@ -209,14 +243,15 @@ pub enum KmsDecryptResponse {
 /// and have no password to bind. The auth_methods list is sealed
 /// INSIDE the encrypted payload so an engineer with DB write access
 /// cannot add a method without breaking the AES-GCM tag.
-#[derive(Debug, Serialize, Deserialize)]
+/// Not `Debug` (password).
+#[derive(Serialize, Deserialize)]
 pub struct GenerateWalletRequest {
     /// CMK to wrap the freshly-generated DEK with.
     pub kms_key_arn: String,
 
     /// Optional v2 user password.
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
 
     /// Optional v3 enrolled auth methods. When non-empty the enclave
     /// produces a v3 envelope and the password field is ignored.
@@ -277,14 +312,16 @@ pub struct KmsGenerateDataKeyRequest {
 ///   4. Re-seal the EOA private key + the supplied enrolled methods
 ///      under the new DEK as a v3 envelope.
 ///   5. Return the new envelope blob + the owner address.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// Not `Debug` (old_password).
+#[derive(Serialize, Deserialize)]
 pub struct MigrateEnvelopeRequest {
     pub kms_key_arn: String,
     /// The current envelope blob in v1 or v2 form.
     pub old_envelope_blob: String,
     /// Required iff the old envelope is v2.
     #[serde(default)]
-    pub old_password: Option<String>,
+    pub old_password: Option<SecretString>,
     /// Methods to enrol on the new v3 envelope. Must be non-empty.
     pub enrolled_methods: Vec<EnrolledMethod>,
 }
@@ -327,10 +364,16 @@ pub enum KmsGenerateDataKeyResponse {
 ///   2. KMS-Decrypt the old wrapped DEK (Recipient-attested).
 ///   3. AES-GCM-decrypt the inner CBOR payload → EOA priv + existing
 ///      auth_methods.
-///   4. Verify `auth_proof` against the CURRENT methods with
-///      `prehashed_hex` as the expected challenge / nonce. This is
-///      the consent signal — only a user who can already sign for
-///      this wallet may add a new method.
+///   4. Verify `auth_proof` against the CURRENT methods. The expected
+///      challenge / nonce is the domain-separated BOUND challenge
+///      `SHA-256("rift-reseal-v1" || 0x00 || owner_address ||
+///      prehashed_hex || canonical(new_method))` (see
+///      `reseal_helpers::bound_reseal_challenge`). While enforcement is
+///      off (`RESEAL_REQUIRE_BOUND_CHALLENGE` false and the project
+///      bundle doesn't set `require_bound_reseal`), a legacy proof over
+///      the raw `prehashed_hex` is still accepted. This is the consent
+///      signal — only a user who can already sign for this wallet may
+///      add a new method.
 ///   5. Refuse if `new_method` is a duplicate of an existing entry.
 ///   6. KMS-GenerateDataKey → fresh DEK.
 ///   7. AES-GCM-seal `(priv, existing_methods + [new_method])` under
@@ -343,7 +386,8 @@ pub enum KmsGenerateDataKeyResponse {
 /// the method list even if it were to intercept the wire — the
 /// attestation doc identifies the enclave binary, and the reseal
 /// operation is only exposed by THIS enclave's protocol.
-#[derive(Debug, Serialize, Deserialize)]
+/// Not `Debug` (consent proof).
+#[derive(Serialize, Deserialize)]
 pub struct ResealV3Request {
     pub kms_key_arn: String,
     /// The current v3 envelope blob. Must start with `enc:v3:`.
@@ -353,12 +397,16 @@ pub struct ResealV3Request {
     /// that the exact same "must match an enrolled method" check as
     /// on the sign path applies here too.
     pub auth_proof: AuthProof,
-    /// The 32-byte challenge (hex) that `auth_proof` was signed
-    /// against. For passkey proofs this is compared to
-    /// `clientDataJSON.challenge`; for OIDC proofs it's compared to
-    /// the `nonce` claim of the id_token. Backend-generated + one
-    /// shot; TTL is enforced upstream (this enclave has no clock
-    /// beyond the attestation timestamp).
+    /// The backend-issued 32-byte one-shot server challenge (hex). TTL
+    /// is enforced upstream (this enclave has no clock beyond the
+    /// attestation timestamp).
+    ///
+    /// Bound mode (preferred): the proof is over
+    /// `bound_reseal_challenge(owner, prehashed, new_method)`, NOT over
+    /// this value directly — the enclave never trusts it as the
+    /// challenge itself. Legacy mode (until enforcement is flipped): the
+    /// proof is over this value as-is (passkey: clientDataJSON.challenge
+    /// = base64url(value); OIDC: nonce = hex(value)).
     pub prehashed_hex: String,
     /// The new method to append to the enrolled_methods list.
     pub new_method: EnrolledMethod,
@@ -394,4 +442,67 @@ pub enum ResealV3Response {
     Err {
         reason: String,
     },
+}
+
+// ─── Health / canary (port 5010) ────────────────────────────────────
+
+/// Parent → Enclave: "are you alive, and which image are you?". All
+/// fields optional; `{}` is a valid request.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct HealthRequest {
+    /// When set, the enclave additionally performs an attested
+    /// kms:GenerateDataKey AND an attested kms:Decrypt of the resulting
+    /// blob against this key, and checks both yield the same data key
+    /// (then wipes it). Success proves the KMS key policy accepts THIS
+    /// enclave's PCR0, which is what rotation must know before retiring
+    /// the previous PCR0. Nothing secret is returned.
+    #[serde(default)]
+    pub kms_key_arn: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum HealthResponse {
+    Ok {
+        /// Crate version of the enclave binary.
+        version: String,
+        /// PCR0 as reported by the NSM, lowercase hex (96 chars). All
+        /// zeros when the enclave runs in debug mode.
+        pcr0: String,
+        /// True iff `kms_key_arn` was supplied and the attested KMS
+        /// GenerateDataKey + Decrypt round trip succeeded.
+        kms_checked: bool,
+    },
+    Err {
+        reason: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_string_is_redacted_and_wire_compatible() {
+        let req: GenerateWalletRequest =
+            serde_json::from_str(r#"{"kms_key_arn":"k","password":"hunter2"}"#).unwrap();
+        let pw = req.password.as_ref().unwrap();
+        assert_eq!(pw.as_bytes(), b"hunter2");
+        assert!(!format!("{pw:?}").contains("hunter2"));
+        // Serialises back to the same plain string.
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["password"], "hunter2");
+    }
+
+    #[test]
+    fn health_request_accepts_empty_object() {
+        let r: HealthRequest = serde_json::from_str("{}").unwrap();
+        assert!(r.kms_key_arn.is_none());
+        let ok = serde_json::to_value(HealthResponse::Ok {
+            version: "0.1.0".into(),
+            pcr0: "00".into(),
+            kms_checked: false,
+        })
+        .unwrap();
+        assert_eq!(ok["Ok"]["pcr0"], "00");
+    }
 }

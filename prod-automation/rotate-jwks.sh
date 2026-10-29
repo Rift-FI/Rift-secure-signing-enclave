@@ -1,94 +1,133 @@
 #!/usr/bin/env bash
-# Refresh Google + Apple JWKS in the enclave, rebuild EIF, capture the
-# new PCR0. Runs on the EC2 host.
+# Build the enclave EIF for rotation and report its PCR0. Two modes:
 #
-# Google rotates JWKS ~weekly. This should be on a weekly cron (or
-# systemd timer). After capturing the new PCR0, run update-kms-pcr0.sh
-# from CloudShell to add it to both KMS keys with an overlap window.
-# Once verified the new enclave signs correctly, graduate the old
-# PCR0 out with `update-kms-pcr0.sh --remove <old-pcr0>`.
+#   --approved-commit <40-hex-sha>   (BUILD mode — what the rotation
+#       Lambda runs on the EC2). Checks out EXACTLY that commit
+#       (detached), refuses a dirty tracked tree, does NOT fetch JWKS or
+#       touch any source file, builds the EIF and prints its PCR0. The
+#       Lambda then compares that PCR0 with the independently approved
+#       value in SSM and only touches KMS policies on an exact match.
+#       Nothing fetched at build time can influence the measured image.
 #
-# What it does, in order:
-#   1. Runs tools/fetch-jwks.mjs to fetch fresh Google + Apple keys.
-#   2. Sanity-checks the emitted snippet.
-#   3. Backs up the current pinned_jwks.rs.
-#   4. Patches pinned_jwks.rs — replaces everything from `fn google_jwks`
-#      to EOF with the fresh snippet (the two functions live at the tail
-#      of the file, in that order).
-#   5. Rebuilds the Docker image + EIF via `make eif`.
-#   6. Captures the new PCR0 via `make pcr0` and validates length.
-#   7. Reports what to do next (KMS policy add + enclave restart).
+#   --refresh-jwks   (PREPARE mode — run by CI or a release engineer on
+#       a workstation/CI runner with nitro-cli + docker, NOT by the
+#       Lambda). Fetches fresh Google + Apple JWKS, patches
+#       enclave/src/pinned_jwks.rs, builds the EIF and prints its PCR0.
+#       The JWKS change must then be reviewed and committed, and the
+#       commit SHA + PCR0 published to SSM (see prod-automation/README.md
+#       "Enclave release approval"). The EC2 never decides on its own
+#       which JWKS get baked into a key-releasing enclave.
+#
+# Why: previously this script ran on the EC2, pulled origin/main HEAD,
+# fetched JWKS over the network and the Lambda added whatever PCR0
+# came out to the KMS key policies. Anyone able to push to main, tamper
+# with the EC2 checkout, or MITM the JWKS fetch could get an arbitrary
+# enclave image trusted by KMS. Now the trusted value is set out of band.
 #
 # Environment:
-#   ENCLAVE_SRC   — path to enclave repo (default: $HOME/rift/Rift-secure-signing-enclave)
+#   ENCLAVE_SRC   path to the enclave repo (default: $HOME/rift/Rift-secure-signing-enclave)
+#   GIT_REMOTE    remote to fetch the approved commit from (default: origin)
 #
-# Usage:
-#   ./rotate-jwks.sh 2>&1 | tee /var/log/rift-jwks-rotation.log
+# Output (parsed by rotate-jwks-lambda.py — keep the formats):
+#   "new PCR0: <96 hex>"
+#   "built commit: <40 hex>"
 
 set -euo pipefail
 
 ENCLAVE_SRC="${ENCLAVE_SRC:-${HOME:-/home/ec2-user}/rift/Rift-secure-signing-enclave}"
-JWKS_SNIPPET="/tmp/jwks-snippet-$(date +%s).rs"
-BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
+GIT_REMOTE="${GIT_REMOTE:-origin}"
 
 log() { printf "[%s] %s\n" "$(date -Is)" "$*"; }
 die() { printf "\n[FATAL] %s\n" "$*" >&2; exit 1; }
 
-cd "$ENCLAVE_SRC" 2>/dev/null || die "enclave repo not at $ENCLAVE_SRC"
+usage() {
+    cat >&2 <<USAGE
+Usage:
+  $0 --approved-commit <40-hex-sha>   # build mode (rotation Lambda)
+  $0 --refresh-jwks                   # prepare mode (CI / release engineer)
+USAGE
+    exit 1
+}
 
+MODE="${1:-}"
+APPROVED_COMMIT="${2:-}"
+case "$MODE" in
+    --approved-commit)
+        [[ "$APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+            || die "approved commit must be a full 40-char lowercase hex SHA, got '$APPROVED_COMMIT'"
+        ;;
+    --refresh-jwks) ;;
+    *) usage ;;
+esac
+
+cd "$ENCLAVE_SRC" 2>/dev/null || die "enclave repo not at $ENCLAVE_SRC"
+command -v jq >/dev/null 2>&1 || die "jq required"
+
+build_and_report() {
+    log "── build EIF ──"
+    if ! sudo make eif 2>&1 | tail -6; then
+        die "make eif failed"
+    fi
+
+    log "── capture PCR0 ──"
+    NEW_PCR0="$(sudo make pcr0 | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+    [[ "$NEW_PCR0" =~ ^[0-9a-f]{96}$ ]] || die "PCR0 wrong shape (${#NEW_PCR0} chars, want 96 hex): $NEW_PCR0"
+    BUILT_COMMIT="$(git rev-parse HEAD)"
+    # Unprefixed lines for the Lambda's regexes.
+    echo "new PCR0: $NEW_PCR0"
+    echo "built commit: $BUILT_COMMIT"
+
+    OLD_PCR0="$(sudo nitro-cli describe-enclaves 2>/dev/null | jq -r '.[0].Measurements.PCR0 // empty' || true)"
+    log "currently-running PCR0: ${OLD_PCR0:-<no enclave running>}"
+}
+
+if [[ "$MODE" == "--approved-commit" ]]; then
+    log "── BUILD mode: approved commit $APPROVED_COMMIT ──"
+    # Tracked files must be pristine: a local edit would be measured
+    # into the EIF and (correctly) fail the PCR0 comparison, but fail
+    # here first with a clear message.
+    if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+        git status --short --untracked-files=no | sed 's/^/  /'
+        die "tracked files modified in $ENCLAVE_SRC — refusing to build (clean the checkout manually)"
+    fi
+    git fetch --quiet "$GIT_REMOTE" "$APPROVED_COMMIT" 2>/dev/null \
+        || git fetch --quiet --tags "$GIT_REMOTE" \
+        || die "git fetch failed — check remote + credentials"
+    git cat-file -e "${APPROVED_COMMIT}^{commit}" 2>/dev/null \
+        || die "approved commit $APPROVED_COMMIT not found after fetch"
+    git -c advice.detachedHead=false checkout --quiet --detach "$APPROVED_COMMIT" \
+        || die "git checkout $APPROVED_COMMIT failed"
+    HEAD_SHA="$(git rev-parse HEAD)"
+    [[ "$HEAD_SHA" == "$APPROVED_COMMIT" ]] || die "HEAD is $HEAD_SHA, expected $APPROVED_COMMIT"
+    log "checked out $(git log -1 --oneline)"
+    build_and_report
+    exit 0
+fi
+
+# ── PREPARE mode ─────────────────────────────────────────────────────
 command -v node >/dev/null 2>&1 || die "node required (for tools/fetch-jwks.mjs)"
-command -v jq   >/dev/null 2>&1 || die "jq required"
 [[ -f tools/fetch-jwks.mjs ]] || die "tools/fetch-jwks.mjs missing"
 [[ -f enclave/src/pinned_jwks.rs ]] || die "enclave/src/pinned_jwks.rs missing"
 
-log "── STEP 0: sync repo to origin/main before rebuilding ──"
-# Prevents regressions like 2026-08-10, where this script ran against
-# a checkout on tag v1.0.0 (pre-Option-C) and rebuilt an enclave binary
-# missing per-project accept-list support. Any partner (Blockfinax etc.)
-# with a signed_config bundle was silently rejected until we manually
-# `git pull`'d and rebuilt.
-#
-# `git stash -u` protects local edits (Makefile tweaks, previous
-# pinned_jwks.rs from an earlier rotation) — we restore them in STEP 2
-# by re-patching the fresh main-branch pinned_jwks.rs anyway.
-#
-# Failure to sync is FATAL — better to alert on a stale checkout than
-# silently rebuild yesterday's binary. Ops sees the alert, fixes the
-# repo state manually, re-runs the rotation.
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-log "current branch: $CURRENT_BRANCH"
-git fetch origin main 2>&1 | sed 's/^/  /' || die "git fetch failed — check remote + credentials"
-if [[ "$CURRENT_BRANCH" != "main" ]]; then
-    log "switching from '$CURRENT_BRANCH' to main"
-    git stash push -u -m "rotate-jwks pre-sync $(date -Is)" 2>&1 | sed 's/^/  /' || true
-    git checkout main || die "git checkout main failed"
-fi
-git pull --ff-only origin main 2>&1 | sed 's/^/  /' || die "git pull --ff-only failed — resolve divergence manually"
-log "synced to $(git log -1 --oneline)"
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/rift-jwks.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+JWKS_SNIPPET="$WORKDIR/jwks-snippet.rs"
 
-log "── STEP 1: fetch fresh JWKS from Google + Apple ──"
+log "── PREPARE mode: fetch fresh JWKS from Google + Apple ──"
 node tools/fetch-jwks.mjs > "$JWKS_SNIPPET" || die "fetch-jwks failed"
-log "wrote $JWKS_SNIPPET ($(wc -l < "$JWKS_SNIPPET") lines)"
-
+log "fetched snippet ($(wc -l < "$JWKS_SNIPPET") lines)"
 grep -q "google_jwks" "$JWKS_SNIPPET" || die "snippet missing google_jwks fn"
 grep -q "apple_jwks"  "$JWKS_SNIPPET" || die "snippet missing apple_jwks fn"
 
-log "── STEP 2: back up + patch pinned_jwks.rs ──"
-cp enclave/src/pinned_jwks.rs "enclave/src/pinned_jwks.rs.bak-$BACKUP_STAMP"
-log "backup: enclave/src/pinned_jwks.rs.bak-$BACKUP_STAMP"
-
-# Normalise pub/private visibility to match the existing file's style
-# (google_jwks and apple_jwks are file-private in pinned_jwks.rs; the
-# public entry point is current_jwks() which stays put).
+# Normalise pub/private visibility to match the existing file's style.
 sed -i 's/^pub fn google_jwks/fn google_jwks/; s/^pub fn apple_jwks/fn apple_jwks/' "$JWKS_SNIPPET"
 
-python3 - <<PYEOF
-import re, sys
+JWKS_SNIPPET="$JWKS_SNIPPET" python3 - <<'PYEOF'
+import datetime, os, re, sys
 src_path = "enclave/src/pinned_jwks.rs"
-snippet_path = "$JWKS_SNIPPET"
 with open(src_path) as f:
     src = f.read()
-with open(snippet_path) as f:
+with open(os.environ["JWKS_SNIPPET"]) as f:
     snippet = f.read()
 # Replace from first "fn google_jwks" to EOF. current_jwks() and the
 # module docs above stay untouched.
@@ -96,66 +135,33 @@ m = re.search(r'^fn google_jwks', src, re.M)
 if not m:
     sys.exit("could not locate 'fn google_jwks' in pinned_jwks.rs")
 head = src[:m.start()]
-# Also refresh the "Last refreshed:" comment line above (if present)
-import datetime
 today = datetime.date.today().isoformat()
-head = re.sub(
-    r'^//! Last refreshed:.*$',
-    f'//! Last refreshed: {today}. Schedule next refresh for ~+7 days.',
-    head, count=1, flags=re.M
-)
-new = head + snippet.rstrip() + "\n"
+head = re.sub(r'^//! Last refreshed:.*$',
+              f'//! Last refreshed: {today}. Schedule next refresh for ~+7 days.',
+              head, count=1, flags=re.M)
 with open(src_path, "w") as f:
-    f.write(new)
-print(f"patched {src_path}: {len(head)} bytes preserved, {len(snippet)} bytes replaced tail")
+    f.write(head + snippet.rstrip() + "\n")
+print(f"patched {src_path}")
 PYEOF
 
-log "── STEP 3: rebuild EIF ──"
-sudo make eif 2>&1 | tail -6
+git --no-pager diff --stat -- enclave/src/pinned_jwks.rs || true
+build_and_report
 
-log "── STEP 4: capture new PCR0 ──"
-NEW_PCR0="$(sudo make pcr0 | tr -d '[:space:]')"
-[[ ${#NEW_PCR0} -eq 96 ]] || die "PCR0 wrong length (${#NEW_PCR0}, want 96): $NEW_PCR0"
-log "new PCR0: $NEW_PCR0"
+cat <<NEXT
 
-OLD_PCR0="$(sudo nitro-cli describe-enclaves 2>/dev/null | jq -r '.[0].Measurements.PCR0 // empty')"
-log "currently-running PCR0: ${OLD_PCR0:-<no enclave running>}"
+════════════════════════════════════════════════════
+ JWKS REFRESH PREPARED (nothing deployed, no KMS change)
+════════════════════════════════════════════════════
+  Candidate PCR0 : $NEW_PCR0   (built from a DIRTY tree: $BUILT_COMMIT + JWKS patch)
 
-# Persist for follow-up scripts
-STATE_FILE="$HOME/rift/jwks-rotation-state.json"
-mkdir -p "$(dirname "$STATE_FILE")"
-cat > "$STATE_FILE" <<JSON
-{
-  "rotated_at": "$(date -Is)",
-  "new_pcr0": "$NEW_PCR0",
-  "old_pcr0": "${OLD_PCR0:-null}",
-  "backup_file": "enclave/src/pinned_jwks.rs.bak-$BACKUP_STAMP"
-}
-JSON
-log "state: $STATE_FILE"
-
-echo
-echo "════════════════════════════════════════════════════"
-echo " JWKS ROTATION READY"
-echo "════════════════════════════════════════════════════"
-echo "  Old PCR0 : ${OLD_PCR0:-<none>}"
-echo "  New PCR0 : $NEW_PCR0"
-echo
-echo "── NEXT: in CloudShell (has admin KMS perms), run: ──"
-echo
-echo "    ./update-kms-pcr0.sh --add $NEW_PCR0"
-echo
-echo "That adds the new PCR0 to BOTH KMS keys' policies (keeping the"
-echo "old one for an overlap window)."
-echo
-echo "── THEN: back on this EC2, restart the enclave: ──"
-echo
-echo "    cd $ENCLAVE_SRC && sudo make kill && sudo make run"
-echo "    # If the new enclave-cid differs, bump ENCLAVE_CID in"
-echo "    # /etc/rift-parent-proxy.env and 'sudo systemctl restart rift-parent-proxy'"
-echo
-echo "── LATER (after ~24h overlap window): graduate old PCR0 out ──"
-echo
-if [[ -n "$OLD_PCR0" ]]; then
-    echo "    ./update-kms-pcr0.sh --remove $OLD_PCR0"
-fi
+Next (see prod-automation/README.md "Enclave release approval"):
+  1. Review + commit enclave/src/pinned_jwks.rs, push, get it merged.
+  2. From a clean checkout of the merged commit, rebuild and confirm the
+     PCR0 (two independent builds must agree).
+  3. An approver publishes BOTH values to SSM:
+       aws ssm put-parameter --overwrite --type String \\
+         --name /rift/enclave/approved-commit --value <40-hex-sha>
+       aws ssm put-parameter --overwrite --type String \\
+         --name /rift/enclave/approved-pcr0   --value <96-hex-pcr0>
+  4. Invoke the rotation Lambda (or wait for its schedule).
+NEXT

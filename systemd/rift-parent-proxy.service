@@ -10,17 +10,54 @@ ExecStart=/usr/local/bin/rift-parent-proxy
 Restart=on-failure
 RestartSec=3
 
-# Hardening — proxy holds no secrets but it does hold IAM credentials
+# Dedicated unprivileged account (created by `make install-parent-proxy`).
+# Nothing the proxy does needs root:
+#   - TCP listen on 7777 (unprivileged port);
+#   - AF_VSOCK connect to the enclave and listen on 5006: vsock ports
+#     >= 1024 need no capability, and socket(AF_VSOCK) does not open
+#     /dev/vsock (that node is only used for the local-CID ioctl);
+#   - outbound HTTPS to KMS + IMDSv2 for instance-role credentials
+#     (IMDS is reachable by any local user; hop limit is 2);
+#   - /etc/rift-parent-proxy.env is read by systemd (as root) before the
+#     privilege drop, so it can stay root:root 0600.
+# The proxy never runs nitro-cli, so it needs no access to
+# /dev/nitro_enclaves (group `ne`).
+User=rift-proxy
+Group=rift-proxy
+
+# Hardening — proxy holds no key material but it does hold IAM credentials
 # for KMS, so minimise the blast radius.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/etc /usr
-PrivateDevices=false       # need /dev/vsock for the KMS proxy listener
+# PrivateDevices stays false (the default). NOTE: systemd does not
+# support trailing comments — the previous line
+#   PrivateDevices=false       # need /dev/vsock ...
+# was rejected as an unparseable boolean and ignored.
+PrivateDevices=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+# Additional sandboxing. None of these remove anything the proxy uses
+# (TCP listen on an unprivileged port, AF_VSOCK, outbound HTTPS to KMS
+# and IMDS). Verify with `systemd-analyze security rift-parent-proxy`
+# after install.
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+# TCP/UDP (HTTP, KMS, IMDS, DNS), Unix (resolver/journald), vsock, and
+# netlink (glibc getaddrinfo may query interfaces with AI_ADDRCONFIG).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_VSOCK AF_NETLINK
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
 
 # Env — tune per host. The defaults match the values baked into the
 # enclave binary (port 5005 for signing, 5006 for KMS proxy).
@@ -33,10 +70,15 @@ Environment=KMS_PROXY_PORT=5006
 # only — useful when running the smoke-test curl on the box itself
 # without exposing the port at all.
 #
-# PARENT_PROXY_AUTH_TOKEN, when set, gates /sign with
-# `Authorization: Bearer <token>`. Strongly recommended whenever
-# HTTP_BIND is non-localhost. Smart-wallet on Railway sends the same
-# value in its `Authorization` header.
+# PARENT_PROXY_AUTH_TOKEN gates every enclave route with
+# `Authorization: Bearer <token>`. It is REQUIRED whenever HTTP_BIND is
+# not loopback: the proxy refuses to start otherwise (override for dev
+# only with PARENT_PROXY_ALLOW_INSECURE=1). Smart-wallet / backend send
+# the same value in their `Authorization` header.
+#
+# Optional load limits: PARENT_PROXY_MAX_CONCURRENCY (default 4),
+# PARENT_PROXY_QUEUE_TIMEOUT_MS (10000), PARENT_PROXY_REQUEST_TIMEOUT_SECS
+# (30). ENCLAVE_HEALTH_PORT (5010) is the enclave canary port.
 #
 # Both env vars are intentionally set in the env file (not the unit)
 # so rotating the token is `vi /etc/rift-parent-proxy.env` +

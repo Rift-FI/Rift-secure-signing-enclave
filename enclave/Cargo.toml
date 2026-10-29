@@ -10,6 +10,12 @@ version.workspace = true
 name = "rift-signer-enclave"
 path = "src/main.rs"
 
+[features]
+# Adds `localhost` / `http://localhost:3000` to the compiled-in WebAuthn
+# accept list for local development. NEVER enable for an EIF: the
+# Dockerfile builds with default features only, and default is empty.
+dev-localhost = []
+
 [dependencies]
 # Cross-platform deps from the workspace.
 tokio.workspace = true

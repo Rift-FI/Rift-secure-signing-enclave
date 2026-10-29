@@ -6,9 +6,12 @@
 #   1. SNS topic:      rift-jwks-rotation
 #   2. IAM policy:     rift-jwks-rotator-policy  (KMS put/get on 2 keys,
 #                                                 SSM SendCommand + Get,
-#                                                 SNS Publish, CW Logs)
+#                                                 SSM GetParameter on the
+#                                                 approved-release params
+#                                                 (READ ONLY), SNS Publish,
+#                                                 CW Logs)
 #   3. IAM role:       rift-jwks-rotator-role    (trusted by lambda.amazonaws.com)
-#   4. Lambda:         rift-jwks-rotator (python3.11, 5min timeout, 256MB)
+#   4. Lambda:         rift-jwks-rotator (python3.11, 15min timeout, 256MB)
 #   5. EventBridge:    rift-jwks-rotator-weekly  (Monday 03:00 UTC cron)
 #   6. Subscribes YOUR_EMAIL to the SNS topic (unless SKIP_SNS_SUB=1)
 #
@@ -41,18 +44,28 @@ SNS_TOPIC_NAME="rift-jwks-rotation"
 EVENT_RULE="rift-jwks-rotator-weekly"
 LAMBDA_HANDLER="rotate-jwks-lambda.handler"
 LAMBDA_RUNTIME="python3.11"
-LAMBDA_TIMEOUT=300      # 5 minutes — SSM commands take a while
+LAMBDA_TIMEOUT=900      # Lambda maximum: EIF build + restart + canary
 LAMBDA_MEMORY=256
 
 EC2_INSTANCE_ID="${EC2_INSTANCE_ID:-i-0fa3850b5f3543e16}"
 OLD_KMS_KEY_ID="${OLD_KMS_KEY_ID:-3ca4d104-d45f-4e9c-b11e-2c96cdcb5dbd}"
 NEW_KMS_KEY_ID="${NEW_KMS_KEY_ID:-4534fc26-ba5d-4f69-92d9-7aa96d8668ea}"
 ENCLAVE_SRC_DIR="${ENCLAVE_SRC_DIR:-/home/ec2-user/rift/Rift-secure-signing-enclave}"
+# Approved-release parameters (written ONLY by approvers / CI — the
+# Lambda gets read access, never write; see prod-automation/README.md).
+APPROVED_PCR0_PARAM="${APPROVED_PCR0_PARAM:-/rift/enclave/approved-pcr0}"
+APPROVED_COMMIT_PARAM="${APPROVED_COMMIT_PARAM:-/rift/enclave/approved-commit}"
+# Key used by the post-restart canary (attested GenerateDataKey + Decrypt).
+CANARY_KMS_KEY_ID="${CANARY_KMS_KEY_ID:-$NEW_KMS_KEY_ID}"
 
 # Weekly cron: Monday 03:00 UTC
 SCHEDULE_EXPR="cron(0 3 ? * MON *)"
 
 WORKDIR="$(cd "$(dirname "$0")" && pwd)"
+# Private scratch dir for generated policy / package files (the old fixed
+# /tmp/*.json names could be pre-created or symlinked by another user).
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/rift-jwks-deploy.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
 [[ -f "$WORKDIR/rotate-jwks-lambda.py" ]] || {
     echo "FATAL: rotate-jwks-lambda.py missing next to deploy.sh" >&2; exit 1
 }
@@ -78,7 +91,7 @@ fi
 log "2/6 IAM policy $POLICY_NAME"
 POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
 
-cat > /tmp/lambda-policy.json <<POLICY
+cat > "$TMP/lambda-policy.json" <<POLICY
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -110,6 +123,15 @@ cat > /tmp/lambda-policy.json <<POLICY
       "Resource": "*"
     },
     {
+      "Sid": "ReadApprovedRelease",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": [
+        "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${APPROVED_PCR0_PARAM}",
+        "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${APPROVED_COMMIT_PARAM}"
+      ]
+    },
+    {
       "Sid": "NotifyViaSns",
       "Effect": "Allow",
       "Action": ["sns:Publish"],
@@ -132,18 +154,18 @@ POLICY
 if aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
     # Create a new version (max 5; keep only current + one prior)
     aws iam create-policy-version --policy-arn "$POLICY_ARN" \
-        --policy-document file:///tmp/lambda-policy.json --set-as-default >/dev/null
+        --policy-document "file://$TMP/lambda-policy.json" --set-as-default >/dev/null
     echo "   updated existing policy"
 else
     aws iam create-policy --policy-name "$POLICY_NAME" \
-        --policy-document file:///tmp/lambda-policy.json >/dev/null
+        --policy-document "file://$TMP/lambda-policy.json" >/dev/null
     echo "   created"
 fi
 
 # ── 3. IAM role for Lambda ─────────────────────────────────────────
 log "3/6 IAM role $ROLE_NAME"
 
-cat > /tmp/trust-policy.json <<TRUST
+cat > "$TMP/trust-policy.json" <<TRUST
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -160,7 +182,7 @@ if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
     echo "   role exists"
 else
     aws iam create-role --role-name "$ROLE_NAME" \
-        --assume-role-policy-document file:///tmp/trust-policy.json >/dev/null
+        --assume-role-policy-document "file://$TMP/trust-policy.json" >/dev/null
     echo "   created role"
 fi
 aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
@@ -176,8 +198,7 @@ log "4/6 Lambda $FUNCTION_NAME"
 
 # Package: single Python file, no dependencies beyond boto3 (built-in).
 cd "$WORKDIR"
-rm -f /tmp/lambda-pkg.zip
-zip -q /tmp/lambda-pkg.zip rotate-jwks-lambda.py
+zip -q "$TMP/lambda-pkg.zip" rotate-jwks-lambda.py
 
 ENV_VARS="Variables={"\
 "EC2_INSTANCE_ID=${EC2_INSTANCE_ID},"\
@@ -185,13 +206,16 @@ ENV_VARS="Variables={"\
 "NEW_KMS_KEY_ID=${NEW_KMS_KEY_ID},"\
 "ENCLAVE_SRC_DIR=${ENCLAVE_SRC_DIR},"\
 "SNS_TOPIC_ARN=${SNS_ARN},"\
+"APPROVED_PCR0_PARAM=${APPROVED_PCR0_PARAM},"\
+"APPROVED_COMMIT_PARAM=${APPROVED_COMMIT_PARAM},"\
+"CANARY_KMS_KEY_ID=${CANARY_KMS_KEY_ID},"\
 "REGION=${REGION}"\
 "}"
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
     aws lambda update-function-code --region "$REGION" \
         --function-name "$FUNCTION_NAME" \
-        --zip-file fileb:///tmp/lambda-pkg.zip >/dev/null
+        --zip-file "fileb://$TMP/lambda-pkg.zip" >/dev/null
     aws lambda wait function-updated --region "$REGION" --function-name "$FUNCTION_NAME"
     aws lambda update-function-configuration --region "$REGION" \
         --function-name "$FUNCTION_NAME" \
@@ -207,7 +231,7 @@ else
         --runtime "$LAMBDA_RUNTIME" \
         --role "$ROLE_ARN" \
         --handler "$LAMBDA_HANDLER" \
-        --zip-file fileb:///tmp/lambda-pkg.zip \
+        --zip-file "fileb://$TMP/lambda-pkg.zip" \
         --timeout "$LAMBDA_TIMEOUT" \
         --memory-size "$LAMBDA_MEMORY" \
         --environment "$ENV_VARS" >/dev/null
@@ -259,12 +283,15 @@ Next:
        aws lambda invoke --region ${REGION} \\
          --function-name ${FUNCTION_NAME} \\
          --cli-binary-format raw-in-base64-out \\
-         --payload '{}' /tmp/out.json && cat /tmp/out.json
+         --payload '{}' out.json && cat out.json
 
      Watch logs live:
        aws logs tail /aws/lambda/${FUNCTION_NAME} --follow --region ${REGION}
 
-  3. First scheduled run: next Monday 03:00 UTC.
+  3. First scheduled run: next Monday 03:00 UTC. It is a NO-OP unless
+     an approver has published a new ${APPROVED_COMMIT_PARAM} +
+     ${APPROVED_PCR0_PARAM} pair (prod-automation/README.md,
+     "Enclave release approval").
 SUMMARY
 
 if [[ "${INVOKE_AFTER_DEPLOY:-0}" == "1" ]]; then
@@ -272,8 +299,8 @@ if [[ "${INVOKE_AFTER_DEPLOY:-0}" == "1" ]]; then
     aws lambda invoke --region "$REGION" \
         --function-name "$FUNCTION_NAME" \
         --cli-binary-format raw-in-base64-out \
-        --payload '{}' /tmp/lambda-out.json
+        --payload '{}' "$TMP/lambda-out.json"
     echo "── lambda output ──"
-    cat /tmp/lambda-out.json
+    cat "$TMP/lambda-out.json"
     echo
 fi

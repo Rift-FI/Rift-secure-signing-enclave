@@ -36,8 +36,14 @@
 //! passed through byte-for-byte. Both sides must agree:
 //!
 //! ```text
-//! {"accepted_origins":[...],"accepted_rp_ids":[...],"project_id":"...","signed_at":<unix_secs>}
+//! {"accepted_audiences":[...],"accepted_origins":[...],"accepted_rp_ids":[...],"accepted_top_origins":[...],"project_id":"...","require_bound_reseal":true,"signed_at":<unix_secs>}
 //! ```
+//!
+//! `accepted_audiences`, `accepted_top_origins` and
+//! `require_bound_reseal` are optional (absent ⇒ empty / false), so
+//! bundles signed before they existed keep verifying unchanged. When
+//! present they must sit at their alphabetical position like every
+//! other key.
 //!
 //! - Keys sorted alphabetically (JS: manually; Rust: BTreeMap→
 //!   serde_json produces sorted keys by default).
@@ -116,7 +122,19 @@ pub struct SignedProjectConfig {
     pub accepted_audiences: Vec<String>,
     pub accepted_origins: Vec<String>,
     pub accepted_rp_ids: Vec<String>,
+    /// Top-level origins allowed to embed an accepted origin in an
+    /// iframe for a cross-origin WebAuthn ceremony
+    /// (`clientDataJSON.crossOrigin == true`). Optional; empty ⇒
+    /// cross-origin assertions rejected (the default).
+    #[serde(default)]
+    pub accepted_top_origins: Vec<String>,
     pub project_id: String,
+    /// When true, `/reseal-v3` for this project only accepts consent
+    /// proofs over the domain-separated bound challenge (see
+    /// `reseal_helpers::bound_reseal_challenge`); legacy proofs over the
+    /// raw `prehashed_hex` are refused. Optional; absent ⇒ false.
+    #[serde(default)]
+    pub require_bound_reseal: bool,
     /// Unix seconds. Verifier enforces MAX_CONFIG_AGE_SECS.
     pub signed_at: i64,
 }
@@ -136,6 +154,8 @@ pub struct ResolvedProjectPolicy {
     /// Additional OIDC audiences merged with the enclave's default
     /// list at verify time. Empty means "no per-project additions".
     pub oidc_audiences: Vec<String>,
+    /// Signed opt-in to bound-challenge-only reseal for this project.
+    pub require_bound_reseal: bool,
 }
 
 /// Verify a signed per-project config and produce a WebAuthnPolicy
@@ -180,6 +200,25 @@ fn verify_and_parse(
     now_unix_secs: i64,
     expected_project_id: &str,
 ) -> Result<ResolvedProjectPolicy> {
+    verify_and_parse_with_key(
+        &RIFT_PROJECT_CONFIG_SIGNING_PUBKEY,
+        signed_config_json,
+        signature_b64,
+        now_unix_secs,
+        expected_project_id,
+    )
+}
+
+/// The real verifier, parameterised on the trusted public key so the
+/// unit tests exercise exactly this code (production always passes
+/// `RIFT_PROJECT_CONFIG_SIGNING_PUBKEY`).
+fn verify_and_parse_with_key(
+    pubkey: &[u8; 32],
+    signed_config_json: &[u8],
+    signature_b64: &str,
+    now_unix_secs: i64,
+    expected_project_id: &str,
+) -> Result<ResolvedProjectPolicy> {
     // 1. Decode signature (STANDARD base64, 64 raw bytes for ed25519).
     let sig_bytes = B64
         .decode(signature_b64.trim())
@@ -195,7 +234,7 @@ fn verify_and_parse(
     //    signer does. Ed25519 itself doesn't require pre-hashing
     //    (it's not RSA-PSS) but doing so keeps the wire format
     //    identical to how we'd verify with other algs later.
-    let vk = VerifyingKey::from_bytes(&RIFT_PROJECT_CONFIG_SIGNING_PUBKEY)
+    let vk = VerifyingKey::from_bytes(pubkey)
         .context("baked verifier pubkey is invalid — build-time bug")?;
     let hash = Sha256::digest(signed_config_json);
     vk.verify(hash.as_slice(), &sig)
@@ -260,9 +299,11 @@ fn verify_and_parse(
         webauthn: WebAuthnPolicy::from_owned(
             cfg.accepted_rp_ids,
             cfg.accepted_origins,
+            cfg.accepted_top_origins,
             /* require_user_verified */ true,
         ),
         oidc_audiences: cfg.accepted_audiences,
+        require_bound_reseal: cfg.require_bound_reseal,
     })
 }
 
@@ -271,7 +312,16 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use rand::RngCore;
     use sha2::{Digest, Sha256};
+
+    /// ed25519-dalek is built without its `rand_core` feature (the
+    /// enclave only verifies), so build test keys from raw OS entropy.
+    fn fresh_signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        SigningKey::from_bytes(&seed)
+    }
 
     /// Build a fresh keypair + set the baked pubkey to match via a
     /// verifier constructed from the fresh key. Avoids depending on
@@ -285,8 +335,8 @@ mod tests {
         B64.encode(sig.to_bytes())
     }
 
-    /// Verify with an explicit pubkey (test-only helper) so we can
-    /// exercise verify_and_parse without touching the baked constant.
+    /// Thin alias so the tests below read naturally; calls the REAL
+    /// production verifier with a test key.
     fn verify_with_pubkey(
         pubkey: &[u8; 32],
         signed_config_json: &[u8],
@@ -294,37 +344,12 @@ mod tests {
         now_unix_secs: i64,
         expected_project_id: &str,
     ) -> Result<ResolvedProjectPolicy> {
-        let sig_bytes = B64.decode(signature_b64.trim()).unwrap();
-        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
-        let sig = Signature::from_bytes(&sig_arr);
-        let vk = VerifyingKey::from_bytes(pubkey).unwrap();
-        let hash = Sha256::digest(signed_config_json);
-        vk.verify(hash.as_slice(), &sig)
-            .context("sig verify")?;
-        let cfg: SignedProjectConfig = serde_json::from_slice(signed_config_json)?;
-        if cfg.project_id != expected_project_id {
-            anyhow::bail!("project_id mismatch");
-        }
-        let age = now_unix_secs.saturating_sub(cfg.signed_at);
-        if age > MAX_CONFIG_AGE_SECS {
-            anyhow::bail!("stale");
-        }
-        if cfg.accepted_origins.is_empty() || cfg.accepted_rp_ids.is_empty() {
-            anyhow::bail!("empty");
-        }
-        Ok(ResolvedProjectPolicy {
-            webauthn: WebAuthnPolicy::from_owned(
-                cfg.accepted_rp_ids,
-                cfg.accepted_origins,
-                true,
-            ),
-            oidc_audiences: cfg.accepted_audiences,
-        })
+        verify_and_parse_with_key(pubkey, signed_config_json, signature_b64, now_unix_secs, expected_project_id)
     }
 
     #[test]
     fn valid_signature_produces_policy() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = fresh_signing_key();
         let pubkey = sk.verifying_key().to_bytes();
         let now: i64 = 1_723_456_789;
         let json = format!(
@@ -341,31 +366,31 @@ mod tests {
 
     #[test]
     fn forged_signature_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = fresh_signing_key();
         let pubkey = sk.verifying_key().to_bytes();
         let now: i64 = 1_723_456_789;
         let json = br#"{"accepted_origins":["https://evil.com"],"accepted_rp_ids":["evil.com"],"project_id":"proj-1","signed_at":1723456729}"#;
         // Signature over DIFFERENT bytes than what we pass to verifier
         let sig = signed_bundle(&sk, b"different bytes");
-        let err = verify_with_pubkey(&pubkey, json, &sig, now, "proj-1").unwrap_err();
-        assert!(err.to_string().contains("sig verify"), "{err}");
+        let err = verify_with_pubkey(&pubkey, json, &sig, now, "proj-1").err().expect("verification must fail");
+        assert!(format!("{err:#}").contains("signature verification failed"), "{err:#}");
     }
 
     #[test]
     fn wrong_project_id_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = fresh_signing_key();
         let pubkey = sk.verifying_key().to_bytes();
         let now: i64 = 1_723_456_789;
         let json = br#"{"accepted_origins":["https://app.acme.com"],"accepted_rp_ids":["acme.com"],"project_id":"proj-A","signed_at":1723456729}"#;
         let sig = signed_bundle(&sk, json);
         // Request context claims proj-B but signed config is for proj-A
-        let err = verify_with_pubkey(&pubkey, json, &sig, now, "proj-B").unwrap_err();
+        let err = verify_with_pubkey(&pubkey, json, &sig, now, "proj-B").err().expect("verification must fail");
         assert!(err.to_string().contains("project_id"), "{err}");
     }
 
     #[test]
     fn stale_config_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = fresh_signing_key();
         let pubkey = sk.verifying_key().to_bytes();
         let now: i64 = 2_000_000_000;
         // Signed 100 days ago
@@ -375,18 +400,63 @@ mod tests {
             signed_at
         );
         let sig = signed_bundle(&sk, json.as_bytes());
-        let err = verify_with_pubkey(&pubkey, json.as_bytes(), &sig, now, "proj-1").unwrap_err();
+        let err = verify_with_pubkey(&pubkey, json.as_bytes(), &sig, now, "proj-1").err().expect("verification must fail");
         assert!(err.to_string().contains("stale"), "{err}");
     }
 
     #[test]
     fn empty_lists_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = fresh_signing_key();
         let pubkey = sk.verifying_key().to_bytes();
         let now: i64 = 1_723_456_789;
         let json = br#"{"accepted_origins":[],"accepted_rp_ids":["acme.com"],"project_id":"proj-1","signed_at":1723456729}"#;
         let sig = signed_bundle(&sk, json);
-        let err = verify_with_pubkey(&pubkey, json, &sig, now, "proj-1").unwrap_err();
+        let err = verify_with_pubkey(&pubkey, json, &sig, now, "proj-1").err().expect("verification must fail");
         assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn future_signed_at_rejected() {
+        let sk = fresh_signing_key();
+        let pubkey = sk.verifying_key().to_bytes();
+        let now: i64 = 1_723_456_789;
+        let json = format!(
+            r#"{{"accepted_origins":["https://app.acme.com"],"accepted_rp_ids":["acme.com"],"project_id":"proj-1","signed_at":{}}}"#,
+            now + 3600
+        );
+        let sig = signed_bundle(&sk, json.as_bytes());
+        let err = verify_with_pubkey(&pubkey, json.as_bytes(), &sig, now, "proj-1").err().expect("must fail");
+        assert!(err.to_string().contains("future"), "{err}");
+    }
+
+    #[test]
+    fn baked_key_rejects_bundle_signed_by_other_key() {
+        // The production entry point (baked pubkey) must refuse a bundle
+        // signed by any other key and degrade to None.
+        let sk = fresh_signing_key();
+        let now: i64 = 1_723_456_789;
+        let json = br#"{"accepted_origins":["https://app.acme.com"],"accepted_rp_ids":["acme.com"],"project_id":"proj-1","signed_at":1723456729}"#;
+        let sig = signed_bundle(&sk, json);
+        assert!(resolve_policy(json, &sig, now, "proj-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn optional_fields_parse() {
+        let sk = fresh_signing_key();
+        let pubkey = sk.verifying_key().to_bytes();
+        let now: i64 = 1_723_456_789;
+        let json = br#"{"accepted_audiences":["aud-1"],"accepted_origins":["https://app.acme.com"],"accepted_rp_ids":["acme.com"],"accepted_top_origins":["https://shop.acme.com"],"project_id":"proj-1","require_bound_reseal":true,"signed_at":1723456729}"#;
+        let sig = signed_bundle(&sk, json);
+        let p = verify_with_pubkey(&pubkey, json, &sig, now, "proj-1").unwrap();
+        assert!(p.require_bound_reseal);
+        assert_eq!(p.oidc_audiences, vec!["aud-1".to_string()]);
+        assert!(p.webauthn.accepted_top_origins.iter().any(|o| o == "https://shop.acme.com"));
+
+        // Absent ⇒ false / empty.
+        let json = br#"{"accepted_origins":["https://app.acme.com"],"accepted_rp_ids":["acme.com"],"project_id":"proj-1","signed_at":1723456729}"#;
+        let sig = signed_bundle(&sk, json);
+        let p = verify_with_pubkey(&pubkey, json, &sig, now, "proj-1").unwrap();
+        assert!(!p.require_bound_reseal);
+        assert_eq!(p.webauthn.accepted_top_origins.iter().count(), 0);
     }
 }

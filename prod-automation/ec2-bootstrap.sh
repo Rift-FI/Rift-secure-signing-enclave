@@ -126,6 +126,14 @@ PCR0=$(sudo -E env PATH="$PATH" make pcr0 | tr -d '[:space:]')
 [[ ${#PCR0} -eq 96 ]] || die "PCR0 looks wrong (len ${#PCR0}, want 96): $PCR0"
 
 step "8 · install parent-proxy as systemd unit"
+# The proxy fails closed: on its default 0.0.0.0:7777 bind it refuses to
+# start without PARENT_PROXY_AUTH_TOKEN. Seed a root-only env file with a
+# random token on first install (existing files are left untouched).
+if ! sudo test -f /etc/rift-parent-proxy.env; then
+  sudo install -o root -g root -m 0600 /dev/null /etc/rift-parent-proxy.env
+  echo "PARENT_PROXY_AUTH_TOKEN=$(openssl rand -hex 32)" | sudo tee -a /etc/rift-parent-proxy.env >/dev/null
+  log "created /etc/rift-parent-proxy.env with a random PARENT_PROXY_AUTH_TOKEN (root-only)"
+fi
 # NOT under sudo — the target's cargo build must run as ec2-user so it
 # can find the rustup toolchain in $HOME/.rustup. The Makefile uses
 # `sudo` per-line inside install-parent-proxy for the cp + systemctl.

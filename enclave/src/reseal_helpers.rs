@@ -10,6 +10,7 @@
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use sha2::{Digest, Sha256};
 
 use crate::envelope_v3;
 use crate::protocol::EnrolledMethod;
@@ -77,6 +78,152 @@ pub fn is_duplicate_method(
         ) => e_cid == n_cid,
         _ => false,
     })
+}
+
+// ─── Bound (domain-separated) reseal challenge ──────────────────────
+//
+// Legacy reseal verified `auth_proof` against the caller-supplied
+// `prehashed_hex` as-is. That value is just 32 bytes the backend picked,
+// so ANY proof the user ever produced over ANY 32-byte value — notably a
+// sign-path proof whose challenge is a UserOp hash — could be replayed
+// by whoever controls the backend/parent to enrol an attacker's method.
+//
+// Bound mode: the enclave itself derives the challenge the proof must
+// be over, from values it trusts or checks:
+//
+//   challenge = SHA-256(
+//       "rift-reseal-v1"            14 ASCII bytes (domain tag)
+//    || 0x00                        separator
+//    || owner_address               20 raw bytes, derived INSIDE the
+//                                   enclave from the unsealed key
+//    || server_nonce                32 raw bytes = decoded prehashed_hex
+//                                   (the backend's one-shot challenge;
+//                                   TTL/one-shot still enforced upstream)
+//    || canonical(new_method)       see `canonical_method_bytes`
+//   )
+//
+// A proof over this value can only authorise appending THAT method to
+// THAT wallet, and can never be confused with a sign-path proof (sign
+// challenges are UserOp hashes, not outputs of this domain-tagged hash).
+// The exact client recipe is in README.md § "Bound reseal challenge".
+
+/// Domain tag for the bound reseal challenge. Changing it is a protocol
+/// break for every client.
+pub const RESEAL_DOMAIN_TAG: &[u8] = b"rift-reseal-v1";
+
+/// Enclave-wide enforcement switch for bound reseal challenges.
+///
+/// `false` (current): a reseal proof over the bound challenge is always
+/// accepted; a LEGACY proof over the raw `prehashed_hex` is still
+/// accepted unless the project's signed config bundle sets
+/// `require_bound_reseal: true`.
+///
+/// `true`: legacy reseal proofs are refused for every project. Flip once
+/// all clients (sdk, wallet, widget, partners) produce bound challenges.
+/// Code constant on purpose (not an env var: the enclave has no
+/// trustworthy env), so flipping it is a reviewed rebuild + PCR0 change.
+pub const RESEAL_REQUIRE_BOUND_CHALLENGE: bool = false;
+
+/// Whether legacy (unbound) reseal proofs must be refused, given the
+/// project's signed `require_bound_reseal` flag (false when there is no
+/// valid bundle).
+pub fn reseal_requires_bound(project_flag: bool) -> bool {
+    RESEAL_REQUIRE_BOUND_CHALLENGE || project_flag
+}
+
+const METHOD_TAG_OIDC: u8 = 0x01;
+const METHOD_TAG_PASSKEY: u8 = 0x02;
+
+fn push_lv(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Unambiguous byte encoding of a method, over DECODED values (so
+/// base64 padding / alphabet choices on the client can't change it):
+///
+///   OIDC:    0x01 || u32be(len(iss)) || iss(UTF-8) || u32be(len(sub)) || sub(UTF-8)
+///   Passkey: 0x02 || u32be(len(cred_id)) || cred_id || u32be(len(cose)) || cose
+pub fn canonical_method_bytes(m: &envelope_v3::AuthMethod) -> Vec<u8> {
+    let mut out = Vec::new();
+    match m {
+        envelope_v3::AuthMethod::Oidc { iss, sub } => {
+            out.push(METHOD_TAG_OIDC);
+            push_lv(&mut out, iss.as_bytes());
+            push_lv(&mut out, sub.as_bytes());
+        }
+        envelope_v3::AuthMethod::Passkey { cred_id, cose } => {
+            out.push(METHOD_TAG_PASSKEY);
+            push_lv(&mut out, cred_id);
+            push_lv(&mut out, cose);
+        }
+    }
+    out
+}
+
+/// The challenge a bound reseal proof must be over. See notes above.
+pub fn bound_reseal_challenge(
+    owner_address: &[u8; 20],
+    server_nonce: &[u8; 32],
+    new_method: &envelope_v3::AuthMethod,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(RESEAL_DOMAIN_TAG);
+    h.update([0u8]);
+    h.update(owner_address);
+    h.update(server_nonce);
+    h.update(canonical_method_bytes(new_method));
+    h.finalize().into()
+}
+
+/// Parse a 32-byte hex value (optional 0x). Used for `prehashed_hex`
+/// and the user op hash.
+pub fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s.trim_start_matches("0x"))
+        .with_context(|| format!("hex-decode {what}"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{what} must be 32 bytes, got {}", bytes.len()))?;
+    Ok(arr)
+}
+
+/// Which challenge a reseal proof was accepted under. Logged only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResealChallengeMode {
+    Bound,
+    Legacy,
+}
+
+/// Decide which challenge(s) a reseal proof may be verified against and
+/// run `verify` (the real proof verifier) accordingly:
+///   1. Try the bound challenge. Success ⇒ `Bound`.
+///   2. Else, if legacy is still allowed, try the raw server nonce.
+///      Success ⇒ `Legacy`.
+///   3. Else fail.
+///
+/// Pure (verification injected) so the policy is unit-testable without
+/// KMS / NSM.
+pub fn verify_reseal_consent<F>(
+    bound_challenge: &[u8; 32],
+    legacy_challenge: &[u8; 32],
+    require_bound: bool,
+    mut verify: F,
+) -> Result<ResealChallengeMode>
+where
+    F: FnMut(&[u8; 32]) -> Result<()>,
+{
+    match verify(bound_challenge) {
+        Ok(()) => Ok(ResealChallengeMode::Bound),
+        Err(bound_err) => {
+            if require_bound {
+                return Err(bound_err.context(
+                    "reseal requires a bound challenge (rift-reseal-v1); legacy proofs over prehashed_hex are disabled",
+                ));
+            }
+            verify(legacy_challenge).map(|()| ResealChallengeMode::Legacy)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +458,98 @@ mod tests {
             sub: "sub-73".into(),
         };
         assert!(is_duplicate_method(&existing, &candidate));
+    }
+
+    // ─── bound reseal challenge ────────────────────────────────────
+
+    /// Fixed test vectors — README.md § "Bound reseal challenge" quotes
+    /// these exact inputs and outputs so client teams can check their
+    /// implementation. If this changes, the docs (and every client) must.
+    #[test]
+    fn bound_challenge_test_vectors() {
+        let owner: [u8; 20] = hex::decode("00112233445566778899aabbccddeeff00112233")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let nonce = [0xabu8; 32];
+        let oidc = AuthMethod::Oidc {
+            iss: "https://accounts.google.com".into(),
+            sub: "1234567890".into(),
+        };
+        assert_eq!(
+            hex::encode(canonical_method_bytes(&oidc)),
+            "010000001b68747470733a2f2f6163636f756e74732e676f6f676c652e636f6d0000000a31323334353637383930"
+        );
+        assert_eq!(
+            hex::encode(bound_reseal_challenge(&owner, &nonce, &oidc)),
+            "377f6d645f6d470848bad62021c2c318e7da4ad82139f00f05b18a6ac43355cb"
+        );
+        let pk = AuthMethod::Passkey {
+            cred_id: vec![1, 2, 3, 4],
+            cose: vec![0xa5, 0x01, 0x02],
+        };
+        assert_eq!(
+            hex::encode(canonical_method_bytes(&pk)),
+            "02000000040102030400000003a50102"
+        );
+        assert_eq!(
+            hex::encode(bound_reseal_challenge(&owner, &nonce, &pk)),
+            "5b812e4547e39fba673c5e3b9f30a68f0e454c89e8ba179e240afc0365c4dadd"
+        );
+    }
+
+    #[test]
+    fn bound_challenge_binds_every_input() {
+        let owner = [1u8; 20];
+        let nonce = [2u8; 32];
+        let m = AuthMethod::Oidc { iss: "i".into(), sub: "s".into() };
+        let base = bound_reseal_challenge(&owner, &nonce, &m);
+        assert_ne!(base, bound_reseal_challenge(&[9u8; 20], &nonce, &m));
+        assert_ne!(base, bound_reseal_challenge(&owner, &[9u8; 32], &m));
+        assert_ne!(
+            base,
+            bound_reseal_challenge(&owner, &nonce, &AuthMethod::Oidc { iss: "i".into(), sub: "t".into() })
+        );
+        // Length-prefixing: moving bytes between iss and sub changes it.
+        assert_ne!(
+            bound_reseal_challenge(&owner, &nonce, &AuthMethod::Oidc { iss: "ab".into(), sub: "c".into() }),
+            bound_reseal_challenge(&owner, &nonce, &AuthMethod::Oidc { iss: "a".into(), sub: "bc".into() })
+        );
+        assert_ne!(base, nonce);
+    }
+
+    #[test]
+    fn consent_policy_modes() {
+        let bound = [1u8; 32];
+        let legacy = [2u8; 32];
+        let accept = |good: [u8; 32]| {
+            move |c: &[u8; 32]| {
+                if *c == good {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("challenge binding failed"))
+                }
+            }
+        };
+        assert_eq!(verify_reseal_consent(&bound, &legacy, false, accept(bound)).unwrap(), ResealChallengeMode::Bound);
+        assert_eq!(verify_reseal_consent(&bound, &legacy, true, accept(bound)).unwrap(), ResealChallengeMode::Bound);
+        assert_eq!(verify_reseal_consent(&bound, &legacy, false, accept(legacy)).unwrap(), ResealChallengeMode::Legacy);
+        let err = verify_reseal_consent(&bound, &legacy, true, accept(legacy)).unwrap_err();
+        assert!(format!("{err:#}").contains("bound challenge"), "{err:#}");
+        assert!(verify_reseal_consent(&bound, &legacy, false, accept([3u8; 32])).is_err());
+    }
+
+    #[test]
+    fn enforcement_flag_combines_constant_and_project() {
+        assert!(reseal_requires_bound(true));
+        assert_eq!(reseal_requires_bound(false), RESEAL_REQUIRE_BOUND_CHALLENGE);
+    }
+
+    #[test]
+    fn parse_hex32_rules() {
+        assert_eq!(parse_hex32(&"ab".repeat(32), "x").unwrap(), [0xab; 32]);
+        assert_eq!(parse_hex32(&format!("0x{}", "cd".repeat(32)), "x").unwrap(), [0xcd; 32]);
+        assert!(parse_hex32("abcd", "x").is_err());
+        assert!(parse_hex32(&"zz".repeat(32), "x").is_err());
     }
 }

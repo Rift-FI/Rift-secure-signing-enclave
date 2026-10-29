@@ -41,9 +41,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ciborium::value::Value as CborValue;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::password_derivation::{GCM_NONCE_LEN, GCM_TAG_LEN};
 
@@ -71,7 +70,11 @@ pub enum AuthMethod {
 }
 
 /// What the encrypted payload deserialises to inside the enclave.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// No `Debug` / `Clone`: it holds the raw EOA private key. `Drop`
+/// wipes the key bytes, so every early return after a decode (CBOR
+/// validation failures included) still scrubs them.
+#[derive(Serialize, Deserialize)]
 pub struct EnvelopePayload {
     /// Raw secp256k1 private key. 32 bytes.
     #[serde(with = "serde_bytes", rename = "k")]
@@ -81,11 +84,18 @@ pub struct EnvelopePayload {
     pub auth_methods: Vec<AuthMethod>,
 }
 
+impl Drop for EnvelopePayload {
+    fn drop(&mut self) {
+        self.eoa_private_key.zeroize();
+    }
+}
+
 impl EnvelopePayload {
-    /// CBOR-encode for sealing under AES-GCM.
-    pub fn to_cbor(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(128);
-        ciborium::ser::into_writer(self, &mut out)
+    /// CBOR-encode for sealing under AES-GCM. The encoding contains the
+    /// private key, so it is returned as `Zeroizing`.
+    pub fn to_cbor(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(256));
+        ciborium::ser::into_writer(self, &mut *out)
             .map_err(|e| anyhow!("CBOR encode EnvelopePayload: {e}"))?;
         Ok(out)
     }
@@ -160,17 +170,6 @@ impl EnvelopeV3 {
             tag,
         })
     }
-
-    /// Re-serialise to the wire format. Called when generating new
-    /// envelopes after a successful generate-wallet or migration.
-    pub fn to_blob(&self, wrapped_dek_b64: &str) -> String {
-        format!(
-            "{V3_PREFIX}{wrapped_dek_b64}:{}:{}:{}",
-            hex::encode(self.nonce),
-            hex::encode(&self.ciphertext),
-            hex::encode(self.tag),
-        )
-    }
 }
 
 /// Open a v3 envelope: AES-GCM decrypt under `dek` and CBOR-decode.
@@ -186,12 +185,16 @@ pub fn open(env: &EnvelopeV3, dek: &[u8; 32]) -> Result<(Zeroizing<Vec<u8>>, Vec
     ct.extend_from_slice(&env.ciphertext);
     ct.extend_from_slice(&env.tag);
 
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&env.nonce), ct.as_ref())
-        .map_err(|_| anyhow!("invalid credentials"))?;
-    let payload = EnvelopePayload::from_cbor(&plaintext)?;
-    let priv_key = Zeroizing::new(payload.eoa_private_key.clone());
-    Ok((priv_key, payload.auth_methods))
+    // Plaintext CBOR contains the private key: wipe on every path.
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(Nonce::from_slice(&env.nonce), ct.as_ref())
+            .map_err(|_| anyhow!("invalid credentials"))?,
+    );
+    let mut payload = EnvelopePayload::from_cbor(&plaintext)?;
+    let priv_key = Zeroizing::new(std::mem::take(&mut payload.eoa_private_key));
+    let methods = std::mem::take(&mut payload.auth_methods);
+    Ok((priv_key, methods))
 }
 
 /// Seal a v3 envelope. Used by generate-wallet and migration paths.
@@ -211,6 +214,7 @@ pub fn seal(
         auth_methods,
     };
     let cbor = payload.to_cbor()?;
+    drop(payload); // wipes its copy of the key
 
     let cipher = Aes256Gcm::new(dek.into());
     let mut ct_with_tag = cipher
@@ -228,23 +232,10 @@ pub fn seal(
     ))
 }
 
-/// Helper for ad-hoc CBOR access during integration. Not used by the
-/// production hot path.
-#[allow(dead_code)]
-fn cbor_value_kind(v: &CborValue) -> &'static str {
-    match v {
-        CborValue::Integer(_) => "int",
-        CborValue::Bytes(_) => "bytes",
-        CborValue::Text(_) => "text",
-        CborValue::Array(_) => "array",
-        CborValue::Map(_) => "map",
-        _ => "other",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciborium::value::Value as CborValue;
 
     #[test]
     fn round_trip_blob_parse() {
@@ -344,6 +335,7 @@ mod tests {
         let back = EnvelopePayload::from_cbor(&cbor).unwrap();
         assert_eq!(back.eoa_private_key, p.eoa_private_key);
         assert_eq!(back.auth_methods, p.auth_methods);
+        drop(back);
     }
 
     #[test]
@@ -374,7 +366,7 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        let err = EnvelopePayload::from_cbor(&bytes).unwrap_err();
+        let err = EnvelopePayload::from_cbor(&bytes).err().expect("must fail");
         assert!(err.to_string().contains("32 bytes"), "{err:#}");
     }
 
@@ -389,7 +381,7 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        let err = EnvelopePayload::from_cbor(&bytes).unwrap_err();
+        let err = EnvelopePayload::from_cbor(&bytes).err().expect("must fail");
         assert!(err.to_string().contains("at least one"), "{err:#}");
     }
 }

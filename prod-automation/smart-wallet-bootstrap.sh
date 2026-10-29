@@ -44,9 +44,10 @@
 # ─── Optional overrides ─────────────────────────────────────────────
 #   ENV_TAG              sandbox|prod (default sandbox)
 #   SMART_WALLET_REPO    git URL (default: Rift-published)
-#   SMART_WALLET_REF     git tag / branch / SHA. RECOMMENDED: a
-#                        released tag paired with your ENCLAVE_REF.
-#                        Default: feat/enclave-mode
+#   SMART_WALLET_REF     REQUIRED: git commit SHA (preferred) or release
+#                        tag, paired with your ENCLAVE_REF. Branches are
+#                        refused unless ALLOW_UNPINNED_REF=1 (dev only).
+#   ALLOW_UNPINNED_REF   set to 1 to allow a branch name (dev only)
 #   PORT                 default 443
 
 set -Eeuo pipefail
@@ -54,7 +55,8 @@ set -Eeuo pipefail
 ENV_TAG="${ENV_TAG:-sandbox}"
 : "${KMS_KEY_ARN:?set KMS_KEY_ARN=arn:aws:kms:...}"
 SMART_WALLET_REPO="${SMART_WALLET_REPO:-https://github.com/Rift-FI/smart-wallet.git}"
-SMART_WALLET_REF="${SMART_WALLET_REF:-${SMART_WALLET_BRANCH:-feat/enclave-mode}}"
+SMART_WALLET_REF="${SMART_WALLET_REF:-${SMART_WALLET_BRANCH:-}}"
+[[ -n "$SMART_WALLET_REF" ]] || { echo "[fatal] set SMART_WALLET_REF to a commit SHA or release tag" >&2; exit 1; }
 PORT="${PORT:-443}"
 ENV_FILE_EXTRA="${ENV_FILE_EXTRA:-}"
 WORKROOT="$HOME/rift"
@@ -74,8 +76,24 @@ curl -fsS --max-time 3 http://127.0.0.1:7777/health >/dev/null \
 log "parent-proxy healthy"
 
 step "1 · node.js 20"
+# NodeSource's signed package repository, configured explicitly instead
+# of piping their setup script into a root shell. dnf verifies every
+# package against the repo key (gpgcheck=1, repo_gpgcheck=0 matches
+# NodeSource's own setup). Equivalent to their documented manual
+# "signed repo" install.
 if ! command -v node >/dev/null || [[ "$(node -v | cut -d. -f1)" != "v20" ]]; then
-  curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+  NODESOURCE_KEY_URL="https://rpm.nodesource.com/gpgkey/ns-operations-public.key"
+  sudo rpm --import "$NODESOURCE_KEY_URL"
+  sudo tee /etc/yum.repos.d/nodesource-nodejs.repo >/dev/null <<'REPO'
+[nodesource-nodejs]
+name=Node.js Packages for $basearch
+baseurl=https://rpm.nodesource.com/pub_20.x/nodistro/nodejs/$basearch
+priority=9
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.nodesource.com/gpgkey/ns-operations-public.key
+module_hotfixes=1
+REPO
   sudo dnf install -y nodejs
 fi
 node -v
@@ -90,8 +108,17 @@ else
   git clone "$SMART_WALLET_REPO"
 fi
 cd smart-wallet
-git checkout "$SMART_WALLET_BRANCH"
-git pull --ff-only
+git fetch --tags --prune origin
+if git show-ref --verify --quiet "refs/remotes/origin/$SMART_WALLET_REF"; then
+  # A branch name: moving target, not reproducible.
+  [[ "${ALLOW_UNPINNED_REF:-0}" == "1" ]] \
+    || die "SMART_WALLET_REF=$SMART_WALLET_REF is a branch; pin a commit SHA or tag (or ALLOW_UNPINNED_REF=1 for dev)"
+  warn "building from branch $SMART_WALLET_REF (ALLOW_UNPINNED_REF=1)"
+  git checkout --detach "origin/$SMART_WALLET_REF"
+else
+  git -c advice.detachedHead=false checkout --detach "$SMART_WALLET_REF"
+fi
+log "smart-wallet at $(git rev-parse HEAD)"
 npm ci
 
 step "3 · env file at /etc/rift-smartwallet.env"
@@ -106,6 +133,15 @@ PARENT_PROXY_URL=http://127.0.0.1:7777
 KMS_KEY_ARN=$KMS_KEY_ARN
 RIFT_ENV=$ENV_TAG
 EOF
+# The parent-proxy requires its bearer token (fail closed); hand the same
+# value to smart-wallet so its enclave calls authenticate.
+PROXY_TOKEN="$(sudo sed -n 's/^PARENT_PROXY_AUTH_TOKEN=//p' /etc/rift-parent-proxy.env 2>/dev/null | tail -1)"
+if [[ -n "$PROXY_TOKEN" ]]; then
+  echo "PARENT_PROXY_AUTH_TOKEN=$PROXY_TOKEN" | sudo tee -a /etc/rift-smartwallet.env >/dev/null
+else
+  warn "no PARENT_PROXY_AUTH_TOKEN in /etc/rift-parent-proxy.env — smart-wallet calls to the proxy will be rejected"
+fi
+unset PROXY_TOKEN
 if [[ -n "$ENV_FILE_EXTRA" && -f "$ENV_FILE_EXTRA" ]]; then
   sudo tee -a /etc/rift-smartwallet.env >/dev/null < "$ENV_FILE_EXTRA"
   log "appended $(wc -l < "$ENV_FILE_EXTRA") lines from $ENV_FILE_EXTRA"

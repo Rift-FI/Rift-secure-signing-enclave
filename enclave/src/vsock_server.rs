@@ -1,11 +1,11 @@
-//! Vsock accept loop + signing pipeline.
+//! Vsock accept loops + signing / envelope pipelines.
 //!
-//! Each accepted connection corresponds to one signing request from the
-//! parent. Wire frame (both directions): 4-byte big-endian length
+//! Each accepted connection corresponds to one request from the parent.
+//! Wire frame (both directions, FROZEN): 4-byte big-endian length
 //! prefix, then that many bytes of UTF-8 JSON. One request → one
 //! response. No pipelining, no streaming.
 //!
-//! Full crypto pipeline per request (no stubs):
+//! Full crypto pipeline per sign request (no stubs):
 //!   1. Generate ephemeral RSA-2048 keypair (lives in enclave RAM only).
 //!   2. NSM `attest(rsa_public_key_der, nonce)` → COSE_Sign1 doc signed
 //!      by the Nitro Security Module with this enclave's PCR0 inside.
@@ -14,13 +14,17 @@
 //!      KMS itself only releases plaintext if its key policy condition
 //!      matches the PCR0 inside the attestation document — so even with
 //!      valid IAM creds the parent process cannot decrypt.
-//!   4. RSA-OAEP-SHA-256 unwrap the CiphertextForRecipient with our
-//!      ephemeral private key → plaintext DEK.
-//!   5. AES-256-CBC decrypt the envelope payload with the DEK → the
-//!      hex-encoded EOA private key.
-//!   6. Hex-decode → 32 bytes → secp256k1 sign the UserOp hash.
-//!   7. Zeroize the DEK and the plaintext key buffers.
+//!   4. CMS-unwrap the CiphertextForRecipient with our ephemeral private
+//!      key → plaintext DEK.
+//!   5. Decrypt the envelope payload (v1 CBC / v2 GCM / v3 GCM+CBOR).
+//!   6. (v3) verify the consent proof against the sealed methods.
+//!   7. secp256k1 sign the UserOp hash.
 //!   8. Return the 65-byte (r, s, v) signature hex-encoded.
+//!
+//! Secret hygiene: every DEK, derived key, recovered private key and
+//! decrypted payload lives in a `Zeroizing` container (or a type with a
+//! zeroizing `Drop`), so it is wiped on EVERY exit path, including `?`
+//! early returns — no hand-written `zeroize()` calls to forget.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -34,30 +38,38 @@ use rsa::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
 use tracing::{error, info, info_span, warn, Instrument};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::{
     attestation, envelope, envelope_v3, oidc_verification, password_derivation, pinned_jwks,
     project_config,
     protocol::{
-        AuthProof, EnrolledMethod, GenerateWalletRequest, GenerateWalletResponse,
-        KmsDecryptRequest, KmsDecryptResponse, KmsGenerateDataKeyRequest,
+        AuthProof, EnrolledMethod, GenerateWalletRequest, GenerateWalletResponse, HealthRequest,
+        HealthResponse, KmsDecryptRequest, KmsDecryptResponse, KmsGenerateDataKeyRequest,
         KmsGenerateDataKeyResponse, MigrateEnvelopeRequest, MigrateEnvelopeResponse,
         ResealV3Request, ResealV3Response, SignRequest, SignResponse,
     },
-    reseal_helpers::{enrolled_to_authmethod, is_duplicate_method},
+    reseal_helpers::{
+        bound_reseal_challenge, enrolled_to_authmethod, is_duplicate_method, parse_hex32,
+        reseal_requires_bound, verify_reseal_consent,
+    },
     signing, webauthn_verification,
 };
 
-/// Serves four concurrent vsock listeners — sign (5005),
-/// generate-wallet (5007), migrate-envelope (5008), and reseal-v3
-/// (5009). Each is an independent tokio task so a hung listener of one
-/// kind cannot starve the others.
+/// Error text when v1 is disabled at build time (`V1_SIGNING_ENABLED`).
+const V1_DISABLED: &str =
+    "v1 envelopes are disabled in this enclave build — migrate the wallet to v3 (/migrate-envelope)";
+
+/// Serves five concurrent vsock listeners — sign (5005),
+/// generate-wallet (5007), migrate-envelope (5008), reseal-v3 (5009)
+/// and health (5010). Each is an independent tokio task so a hung
+/// listener of one kind cannot starve the others.
 pub async fn serve(
     vsock_port: u32,
     generate_wallet_port: u32,
     migrate_port: u32,
     reseal_port: u32,
+    health_port: u32,
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<()> {
@@ -76,6 +88,11 @@ pub async fn serve(
         parent_cid,
         parent_kms_proxy_port,
     ));
+    let health_handle = tokio::spawn(serve_health(
+        health_port,
+        parent_cid,
+        parent_kms_proxy_port,
+    ));
 
     let sign_result = serve_sign(vsock_port, parent_cid, parent_kms_proxy_port).await;
     // Best-effort: if the sign loop exits, abort the others too so the
@@ -84,6 +101,7 @@ pub async fn serve(
     gw_handle.abort();
     mig_handle.abort();
     reseal_handle.abort();
+    health_handle.abort();
     sign_result
 }
 
@@ -194,65 +212,24 @@ async fn process(
         .await;
     }
 
-    // ─── 1. Ephemeral RSA-2048 keypair ───────────────────────────────
-    // Generated inside the enclave; private key never leaves this
-    // function's stack; the public key goes into the attestation doc.
-    let mut rng = rand::rngs::OsRng;
-    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
-        .context("RSA-2048 key generation failed inside the enclave")?;
-    let rsa_pub = RsaPublicKey::from(&rsa_priv);
-    let rsa_pub_der = rsa_pub
-        .to_public_key_der()
-        .context("encode RSA public key as DER")?
-        .to_vec();
-
-    // ─── 2. Attestation document ────────────────────────────────────
-    // 32 bytes of random nonce — KMS doesn't strictly require it but
-    // it's the right hook for replay defence in a future iteration.
-    let mut nonce = [0u8; 32];
-    rng.fill_bytes(&mut nonce);
-    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce)
-        .context("NSM attestation document generation")?;
-
-    // ─── 3. KMS Decrypt-with-Recipient via parent proxy ─────────────
-    let kms_req = KmsDecryptRequest {
-        attestation_doc_b64: B64.encode(&*attestation_doc),
-        wrapped_dek_b64: req.wrapped_dek_b64.clone(),
-        kms_key_arn: req.kms_key_arn.clone(),
-    };
-    let kms_resp = kms_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
-        .await
-        .context("parent KMS proxy round trip")?;
-    let ciphertext_for_recipient_b64 = match kms_resp {
-        KmsDecryptResponse::Ok {
-            ciphertext_for_recipient_b64,
-        } => ciphertext_for_recipient_b64,
-        KmsDecryptResponse::Err { reason } => {
-            bail!("parent KMS proxy returned error: {reason}")
-        }
-    };
-    let ciphertext_for_recipient = B64
-        .decode(&ciphertext_for_recipient_b64)
-        .context("base64-decode CiphertextForRecipient")?;
-
-    // ─── 4. CMS EnvelopedData unwrap → plaintext DEK ─────────────────
-    // KMS returns a PKCS#7 / CMS EnvelopedData structure (RFC 5652),
-    // NOT a raw RSA-OAEP ciphertext. The structure contains:
-    //   - one or more RecipientInfos, each holding a content-encryption-
-    //     key (CEK) encrypted to a specific public key (ours, by RSA-OAEP)
-    //   - an EncryptedContentInfo holding the actual plaintext DEK
-    //     encrypted to the CEK by AES-256-CBC.
-    // So we: parse CMS → extract our KeyTransRecipientInfo → RSA-OAEP
-    // unwrap the CEK → AES-256-CBC decrypt the encrypted content with
-    // that CEK → that decrypted blob is the plaintext DEK we asked KMS
-    // to decrypt for us.
-    let mut dek = cms_unwrap_data_key(&rsa_priv, &ciphertext_for_recipient)
-        .context("CMS unwrap of KMS CiphertextForRecipient")?;
-
-    if dek.len() != 32 {
-        dek.zeroize();
-        bail!("unwrapped DEK has unexpected length {} (want 32)", dek.len());
+    let is_v2 = req.password.is_some()
+        && req.salt_b64.is_some()
+        && req.nonce_hex.is_some()
+        && req.tag_hex.is_some();
+    // v1 kill switch: refuse BEFORE any KMS call so a disabled build
+    // exposes no CBC surface at all.
+    if !is_v2 && !envelope::V1_SIGNING_ENABLED {
+        bail!(V1_DISABLED);
     }
+
+    // ─── 1-4. KMS Decrypt-with-Recipient → plaintext DEK ────────────
+    let (dek, _attestation_ts) = kms_decrypt_dek(
+        parent_cid,
+        parent_kms_proxy_port,
+        &req.wrapped_dek_b64,
+        &req.kms_key_arn,
+    )
+    .await?;
 
     // ─── 5. Decrypt envelope payload (v1 CBC vs v2 GCM) ─────────────
     // v2 path: password + salt + nonce + tag are all set. We derive
@@ -261,104 +238,86 @@ async fn process(
     // tag check and we return "invalid credentials" without leaking
     // which factor failed.
     //
-    // v1 path: legacy AES-CBC with the raw KMS DEK only. No password
-    // required. Plaintext is the hex string of the private key.
-    let pk_bytes: Vec<u8> = if let (Some(password), Some(salt_b64), Some(nonce_hex), Some(tag_hex)) = (
+    // v1 path: legacy AES-CBC with the raw KMS DEK only. EVERY v1
+    // failure collapses to the single `envelope::V1_OPEN_FAILED` error
+    // (padding-oracle hardening — see envelope.rs).
+    let pk: Zeroizing<[u8; 32]> = if let (Some(password), Some(salt_b64), Some(nonce_hex), Some(tag_hex)) = (
         req.password.as_ref(),
         req.salt_b64.as_ref(),
         req.nonce_hex.as_ref(),
         req.tag_hex.as_ref(),
     ) {
-        // v2: AES-GCM, password-bound. Plaintext is the raw 32-byte key.
-        let salt = B64.decode(salt_b64).context("decode salt_b64")?;
-        if salt.len() != password_derivation::SALT_LEN {
-            dek.zeroize();
-            bail!(
-                "salt must be {} bytes, got {}",
-                password_derivation::SALT_LEN,
-                salt.len()
-            );
-        }
-        let k_user = password_derivation::derive_user_key(password.as_bytes(), &salt)?;
-        let mut dek_arr = [0u8; 32];
-        dek_arr.copy_from_slice(&dek[..]);
-        let k_aes = password_derivation::combine_keys(&dek_arr, &k_user);
-        dek.zeroize();
-        // safe to drop dek_arr; k_aes is Zeroizing<[u8;32]>.
-
-        let nonce_bytes =
-            hex::decode(nonce_hex.trim_start_matches("0x")).context("hex-decode nonce")?;
-        if nonce_bytes.len() != password_derivation::GCM_NONCE_LEN {
-            bail!(
-                "nonce must be {} bytes, got {}",
-                password_derivation::GCM_NONCE_LEN,
-                nonce_bytes.len()
-            );
-        }
-        let mut nonce_arr = [0u8; 12];
-        nonce_arr.copy_from_slice(&nonce_bytes);
-
-        let mut ct = hex::decode(req.ciphertext_hex.trim_start_matches("0x"))
-            .context("hex-decode v2 ciphertext")?;
-        let tag = hex::decode(tag_hex.trim_start_matches("0x")).context("hex-decode tag")?;
-        if tag.len() != password_derivation::GCM_TAG_LEN {
-            bail!(
-                "tag must be {} bytes, got {}",
-                password_derivation::GCM_TAG_LEN,
-                tag.len()
-            );
-        }
-        ct.extend_from_slice(&tag);
-
-        let pt = password_derivation::aead_decrypt(&k_aes, &nonce_arr, &ct)?;
-        if pt.len() != 32 {
-            bail!(
-                "v2 plaintext has unexpected length {} (want 32 raw bytes)",
-                pt.len()
-            );
-        }
-        pt.to_vec()
+        let dek_arr = dek_to_array(dek)?;
+        open_v2(&dek_arr, password.as_bytes(), salt_b64, nonce_hex, &req.ciphertext_hex, tag_hex)?
     } else {
-        // v1: AES-CBC, KMS-only. Plaintext is hex-encoded.
-        let iv = hex::decode(req.iv_hex.trim_start_matches("0x"))
-            .context("hex-decode v1 envelope IV")?;
-        let ciphertext = hex::decode(req.ciphertext_hex.trim_start_matches("0x"))
-            .context("hex-decode v1 envelope ciphertext")?;
-        let plaintext = envelope::decrypt(&dek, &iv, &ciphertext)?;
-        dek.zeroize();
-
-        let pk_hex = std::str::from_utf8(&plaintext)
-            .map_err(|_| anyhow!("decrypted plaintext is not valid UTF-8"))?;
-        let pk_hex_clean = pk_hex.trim().trim_start_matches("0x");
-        let pk_bytes = hex::decode(pk_hex_clean)
-            .context("hex-decode EOA private key from v1 envelope plaintext")?;
-        if pk_bytes.len() != 32 {
-            bail!(
-                "EOA private key has unexpected length {} (want 32)",
-                pk_bytes.len()
-            );
-        }
-        pk_bytes
+        envelope::open_v1_private_key(&dek, &req.iv_hex, &req.ciphertext_hex)?
     };
 
     // ─── 7. Sign ────────────────────────────────────────────────────
-    let user_op_hash_clean = req.user_op_hash_hex.trim_start_matches("0x");
-    let user_op_hash =
-        hex::decode(user_op_hash_clean).context("hex-decode user op hash")?;
-    if user_op_hash.len() != 32 {
-        bail!(
-            "user op hash has unexpected length {} (want 32)",
-            user_op_hash.len()
-        );
-    }
-    let mut hash_arr = [0u8; 32];
-    hash_arr.copy_from_slice(&user_op_hash);
-    let sig = signing::sign_user_op_hash(&pk_bytes, &hash_arr)?;
+    let hash_arr = parse_hex32(&req.user_op_hash_hex, "user op hash")?;
+    let sig = signing::sign_user_op_hash(&pk[..], &hash_arr)?;
 
     // ─── 8. Encode + return ─────────────────────────────────────────
-    let sig_hex = format!("0x{}", hex::encode(&*sig));
+    let sig_hex = format!("0x{}", hex::encode(*sig));
     info!("signing complete, returning signature");
     Ok(sig_hex)
+}
+
+/// Open a v2 (password-bound AES-GCM) payload. Plaintext is the raw
+/// 32-byte key. Shared by sign and migrate.
+fn open_v2(
+    dek: &[u8; 32],
+    password: &[u8],
+    salt_b64: &str,
+    nonce_hex: &str,
+    ciphertext_hex: &str,
+    tag_hex: &str,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let salt = B64.decode(salt_b64).context("decode salt_b64")?;
+    if salt.len() != password_derivation::SALT_LEN {
+        bail!(
+            "salt must be {} bytes, got {}",
+            password_derivation::SALT_LEN,
+            salt.len()
+        );
+    }
+    let k_user = password_derivation::derive_user_key(password, &salt)?;
+    let k_aes = password_derivation::combine_keys(dek, &k_user);
+
+    let nonce_bytes =
+        hex::decode(nonce_hex.trim_start_matches("0x")).context("hex-decode nonce")?;
+    if nonce_bytes.len() != password_derivation::GCM_NONCE_LEN {
+        bail!(
+            "nonce must be {} bytes, got {}",
+            password_derivation::GCM_NONCE_LEN,
+            nonce_bytes.len()
+        );
+    }
+    let mut nonce_arr = [0u8; 12];
+    nonce_arr.copy_from_slice(&nonce_bytes);
+
+    let mut ct = hex::decode(ciphertext_hex.trim_start_matches("0x"))
+        .context("hex-decode v2 ciphertext")?;
+    let tag = hex::decode(tag_hex.trim_start_matches("0x")).context("hex-decode tag")?;
+    if tag.len() != password_derivation::GCM_TAG_LEN {
+        bail!(
+            "tag must be {} bytes, got {}",
+            password_derivation::GCM_TAG_LEN,
+            tag.len()
+        );
+    }
+    ct.extend_from_slice(&tag);
+
+    let pt = password_derivation::aead_decrypt(&k_aes, &nonce_arr, &ct)?;
+    if pt.len() != 32 {
+        bail!(
+            "v2 plaintext has unexpected length {} (want 32 raw bytes)",
+            pt.len()
+        );
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&pt);
+    Ok(out)
 }
 
 // ─── v3 sign pipeline ───────────────────────────────────────────────
@@ -369,6 +328,7 @@ async fn process(
 // stored methods — without this the engineer-with-deploy-access
 // threat model wins.
 
+#[allow(clippy::too_many_arguments)]
 async fn process_v3(
     user_op_hash_hex: String,
     v3_blob: String,
@@ -390,35 +350,19 @@ async fn process_v3(
     let wrapped_dek_b64 = B64.encode(&env.wrapped_dek);
 
     // KMS Decrypt-with-Recipient round trip identical to v1/v2.
-    let (mut dek, attestation_ts) =
+    let (dek, attestation_ts) =
         kms_decrypt_dek(parent_cid, parent_kms_proxy_port, &wrapped_dek_b64, &kms_key_arn).await?;
-    if dek.len() != 32 {
-        dek.zeroize();
-        bail!("unwrapped DEK has unexpected length {} (want 32)", dek.len());
-    }
-    let mut dek_arr = [0u8; 32];
-    dek_arr.copy_from_slice(&dek[..]);
-    dek.zeroize();
+    let dek_arr = dek_to_array(dek)?;
 
     // Open the v3 envelope. On any AES-GCM tag failure we return the
     // exact same "invalid credentials" string as v2 — no leak of
     // which factor (KMS unwrap vs payload decrypt) actually failed.
     let (priv_key, methods) = envelope_v3::open(&env, &dek_arr)?;
-    dek_arr.zeroize();
+    drop(dek_arr);
 
-    // Parse the user op hash up front — we need 32 raw bytes for the
-    // WebAuthn challenge comparison AND for the secp256k1 sign call.
-    let user_op_hash_clean = user_op_hash_hex.trim_start_matches("0x");
-    let user_op_hash_bytes =
-        hex::decode(user_op_hash_clean).context("hex-decode user op hash")?;
-    if user_op_hash_bytes.len() != 32 {
-        bail!(
-            "user op hash has unexpected length {} (want 32)",
-            user_op_hash_bytes.len()
-        );
-    }
-    let mut hash_arr = [0u8; 32];
-    hash_arr.copy_from_slice(&user_op_hash_bytes);
+    // 32 raw bytes for the WebAuthn challenge comparison AND for the
+    // secp256k1 sign call.
+    let hash_arr = parse_hex32(&user_op_hash_hex, "user op hash")?;
 
     // Resolve the WebAuthn accept-list policy for this request. If
     // the parent-proxy passed a Rift-signed per-project bundle AND
@@ -427,17 +371,12 @@ async fn process_v3(
     // hardcoded default (Rift's own hosts). Never hard-errors —
     // a broken bundle silently degrades to default, so a bad deploy
     // of this feature can't take down Rift's own signing.
-    let per_project_policy = match (
+    let per_project_policy = resolve_project_policy(
         signed_config_json.as_deref(),
         signed_config_signature_b64.as_deref(),
         project_id.as_deref(),
-    ) {
-        (Some(json), Some(sig), Some(pid)) => {
-            project_config::resolve_policy(json.as_bytes(), sig, attestation_ts, pid)
-                .unwrap_or(None)
-        }
-        _ => None,
-    };
+        attestation_ts,
+    );
 
     // Verify the auth_proof against one of the enrolled methods. We
     // pick the matching method by `kind`; if none verifies we refuse.
@@ -445,26 +384,52 @@ async fn process_v3(
         .context("v3 auth_proof verification failed")?;
 
     // Sign.
-    let sig = signing::sign_user_op_hash(&priv_key, &hash_arr)?;
-    let sig_hex = format!("0x{}", hex::encode(&*sig));
+    let sig = signing::sign_user_op_hash(&priv_key[..], &hash_arr)?;
+    let sig_hex = format!("0x{}", hex::encode(*sig));
     info!("v3 signing complete, returning signature");
     Ok(sig_hex)
+}
+
+fn resolve_project_policy(
+    signed_config_json: Option<&str>,
+    signed_config_signature_b64: Option<&str>,
+    project_id: Option<&str>,
+    now_unix_secs: i64,
+) -> Option<project_config::ResolvedProjectPolicy> {
+    match (signed_config_json, signed_config_signature_b64, project_id) {
+        (Some(json), Some(sig), Some(pid)) => {
+            project_config::resolve_policy(json.as_bytes(), sig, now_unix_secs, pid)
+                .unwrap_or(None)
+        }
+        _ => None,
+    }
 }
 
 /// Run the auth_proof against the stored auth_methods. The proof
 /// matches if EITHER an OIDC token verifies against a stored
 /// `Oidc { iss, sub }` row OR a WebAuthn assertion verifies against a
 /// stored `Passkey { cred_id, cose }` row whose cred_id matches.
+///
+/// `challenge` is the 32-byte value the proof must be bound to: the
+/// UserOp hash on the sign path, the bound reseal challenge (or, while
+/// legacy is allowed, the raw server nonce) on the reseal path.
+///
+/// WebAuthn signCount: NOT checked. The enclave is stateless and the
+/// sealed envelope stores no per-credential counter; storing one would
+/// be defeated by the backend replaying an older envelope blob, and
+/// synced platform passkeys (iCloud / Google Password Manager) always
+/// report 0. Replay protection comes from the challenge binding instead
+/// (one-shot server nonce / per-transaction UserOp hash).
 fn verify_auth_proof(
     proof: &AuthProof,
     methods: &[envelope_v3::AuthMethod],
-    user_op_hash: &[u8; 32],
+    challenge: &[u8; 32],
     now_unix_secs: i64,
     per_project_policy: Option<&project_config::ResolvedProjectPolicy>,
 ) -> Result<()> {
     match proof {
         AuthProof::Oidc { id_token } => {
-            let user_op_hash_hex = hex::encode(user_op_hash);
+            let challenge_hex = hex::encode(challenge);
             let jwks = pinned_jwks::current_jwks();
             let policy = oidc_verification::OidcTrustPolicy::default_prod();
             // Merge per-project OIDC audiences with the baked default
@@ -477,7 +442,7 @@ fn verify_auth_proof(
                 .unwrap_or(empty.as_slice());
             let verified = oidc_verification::verify_id_token(
                 id_token,
-                &user_op_hash_hex,
+                &challenge_hex,
                 now_unix_secs,
                 &jwks,
                 &policy,
@@ -529,8 +494,7 @@ fn verify_auth_proof(
             // Prefer the signed per-project policy's WebAuthn overrides
             // if the caller provided a bundle AND it verified upstream
             // (see project_config::resolve_policy). If not, fall back
-            // to the hardcoded Rift-only default — same behaviour as
-            // before this feature.
+            // to the hardcoded Rift-only default.
             let default_policy = webauthn_verification::WebAuthnPolicy::default_prod();
             let policy = per_project_policy
                 .map(|p| &p.webauthn)
@@ -540,25 +504,22 @@ fn verify_auth_proof(
                 &client_data_json,
                 &authenticator_data,
                 &signature,
-                user_op_hash,
+                challenge,
                 policy,
             )
         }
     }
 }
 
-/// Helper: run the KMS Decrypt-with-Recipient round trip end-to-end
-/// and return the plaintext DEK plus the attestation timestamp (used
-/// as the trusted "now" for OIDC exp/iat checks).
-///
-/// Hoisted out so v1/v2/v3 sign paths can share it without recopying
-/// the attestation + CMS unwrap dance.
+/// Run the KMS Decrypt-with-Recipient round trip end-to-end and return
+/// the plaintext DEK plus the attestation timestamp (used as the trusted
+/// "now" for OIDC exp/iat checks). Shared by every decrypt path.
 async fn kms_decrypt_dek(
     parent_cid: u32,
     parent_kms_proxy_port: u32,
     wrapped_dek_b64: &str,
     kms_key_arn: &str,
-) -> Result<(Vec<u8>, i64)> {
+) -> Result<(Zeroizing<Vec<u8>>, i64)> {
     let mut rng = rand::rngs::OsRng;
     let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
         .context("RSA-2048 key generation failed inside the enclave")?;
@@ -594,6 +555,80 @@ async fn kms_decrypt_dek(
     Ok((dek, attestation_ts))
 }
 
+/// Attested kms:GenerateDataKey: returns (CiphertextBlob as base64 —
+/// stored in the envelope verbatim, plaintext DEK). Shared by
+/// generate-wallet, migrate, reseal and the health canary.
+async fn kms_generate_dek(
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+    kms_key_arn: &str,
+) -> Result<(String, Zeroizing<[u8; 32]>)> {
+    let mut rng = rand::rngs::OsRng;
+    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
+        .context("RSA-2048 keygen for KMS-recipient channel")?;
+    let rsa_pub = RsaPublicKey::from(&rsa_priv);
+    let rsa_pub_der = rsa_pub
+        .to_public_key_der()
+        .context("encode RSA pubkey")?
+        .to_vec();
+    let mut nonce = [0u8; 32];
+    rng.fill_bytes(&mut nonce);
+    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce)
+        .context("NSM attestation for GenerateDataKey")?;
+
+    let kms_req = KmsGenerateDataKeyRequest {
+        attestation_doc_b64: B64.encode(&*attestation_doc),
+        kms_key_arn: kms_key_arn.to_string(),
+    };
+    let kms_resp = kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
+        .await
+        .context("parent KMS proxy GenerateDataKey round trip")?;
+    let (ciphertext_blob_b64, ciphertext_for_recipient_b64) = match kms_resp {
+        KmsGenerateDataKeyResponse::Ok {
+            ciphertext_blob_b64,
+            ciphertext_for_recipient_b64,
+        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
+        KmsGenerateDataKeyResponse::Err { reason } => {
+            bail!("parent KMS GenerateDataKey returned error: {reason}")
+        }
+    };
+    let cfr = B64
+        .decode(&ciphertext_for_recipient_b64)
+        .context("base64-decode CiphertextForRecipient")?;
+    let dek = cms_unwrap_data_key(&rsa_priv, &cfr)
+        .context("CMS unwrap of CiphertextForRecipient")?;
+    Ok((ciphertext_blob_b64, dek_to_array(dek)?))
+}
+
+/// Length-check a DEK and move it into a fixed array. Both sides are
+/// `Zeroizing`, so nothing is left behind on either path.
+fn dek_to_array(dek: Zeroizing<Vec<u8>>) -> Result<Zeroizing<[u8; 32]>> {
+    if dek.len() != 32 {
+        bail!("unwrapped DEK has unexpected length {} (want 32)", dek.len());
+    }
+    let mut arr = Zeroizing::new([0u8; 32]);
+    arr.copy_from_slice(&dek);
+    Ok(arr)
+}
+
+/// Ethereum address (0x-prefixed lowercase) + raw 20 bytes of a raw
+/// secp256k1 private key.
+fn owner_address_of(priv_key: &[u8]) -> Result<([u8; 20], String)> {
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+
+    if priv_key.len() != 32 {
+        bail!("private key must be 32 bytes, got {}", priv_key.len());
+    }
+    let signing_key = SigningKey::from_bytes(priv_key.into())
+        .map_err(|e| anyhow!("recovered priv key rejected by k256: {e}"))?;
+    let uncompressed = signing_key.verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&uncompressed.as_bytes()[1..]);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..]);
+    Ok((addr, format!("0x{}", hex::encode(addr))))
+}
+
 // ─── Generate-wallet pipeline ────────────────────────────────────────
 
 async fn handle_one_generate_wallet(
@@ -627,146 +662,80 @@ async fn process_generate_wallet(
 ) -> Result<(String, String)> {
     use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     use k256::ecdsa::SigningKey;
-    use sha3::{Digest, Keccak256};
 
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
-    // 1. Ephemeral RSA-2048 for KMS-Decrypt-with-Recipient (used to
-    //    receive the freshly-generated DEK from KMS).
-    let mut rng = rand::rngs::OsRng;
-    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
-        .context("RSA-2048 keygen for KMS-recipient channel")?;
-    let rsa_pub = RsaPublicKey::from(&rsa_priv);
-    let rsa_pub_der = rsa_pub
-        .to_public_key_der()
-        .context("encode RSA pubkey")?
-        .to_vec();
-
-    // 2. NSM attestation with the RSA pubkey baked in.
-    let mut nonce = [0u8; 32];
-    rng.fill_bytes(&mut nonce);
-    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce)
-        .context("NSM attestation for generate-wallet")?;
-
-    // 3. Ask the parent KMS proxy to call kms:GenerateDataKey with the
-    //    recipient attestation. We get back BOTH the KMS-wrapped DEK
-    //    (CiphertextBlob, store it in the envelope verbatim) AND the
-    //    RSA-OAEP-wrapped plaintext DEK (CiphertextForRecipient, the
-    //    enclave unwraps to encrypt the freshly-generated EOA key).
-    let kms_req = KmsGenerateDataKeyRequest {
-        attestation_doc_b64: B64.encode(&*attestation_doc),
-        kms_key_arn: req.kms_key_arn.clone(),
-    };
-    let kms_resp = kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
-        .await
-        .context("parent KMS proxy GenerateDataKey round trip")?;
-    let (ciphertext_blob_b64, ciphertext_for_recipient_b64) = match kms_resp {
-        KmsGenerateDataKeyResponse::Ok {
-            ciphertext_blob_b64,
-            ciphertext_for_recipient_b64,
-        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
-        KmsGenerateDataKeyResponse::Err { reason } => {
-            bail!("parent KMS GenerateDataKey returned error: {reason}")
-        }
-    };
-    let cfr = B64
-        .decode(&ciphertext_for_recipient_b64)
-        .context("base64-decode CiphertextForRecipient")?;
-
-    // 4. CMS unwrap → plaintext DEK (same as the decrypt path).
-    let mut dek = cms_unwrap_data_key(&rsa_priv, &cfr)
-        .context("CMS unwrap of CiphertextForRecipient")?;
-    if dek.len() != 32 {
-        dek.zeroize();
-        bail!("DEK has unexpected length {} (want 32)", dek.len());
+    let is_v1 = req.enrolled_methods.is_empty() && req.password.is_none();
+    if is_v1 && !envelope::V1_SIGNING_ENABLED {
+        bail!(V1_DISABLED);
     }
 
+    // Validate + convert enrolled methods BEFORE generating any key
+    // material or calling KMS.
+    let mut auth_methods: Vec<envelope_v3::AuthMethod> =
+        Vec::with_capacity(req.enrolled_methods.len());
+    for m in &req.enrolled_methods {
+        match m {
+            EnrolledMethod::Oidc { iss, sub } => {
+                auth_methods.push(envelope_v3::AuthMethod::Oidc {
+                    iss: iss.clone(),
+                    sub: sub.clone(),
+                });
+            }
+            EnrolledMethod::Passkey { cred_id_b64, cose_pubkey_b64 } => {
+                let cred_id = B64
+                    .decode(cred_id_b64)
+                    .context("base64-decode enrolled cred_id")?;
+                let cose = B64
+                    .decode(cose_pubkey_b64)
+                    .context("base64-decode enrolled cose")?;
+                // Validate the COSE bytes parse — refuse a bad
+                // enrolment at the gate rather than at first sign.
+                webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose)
+                    .context("validate enrolled passkey COSE_Key")?;
+                auth_methods.push(envelope_v3::AuthMethod::Passkey { cred_id, cose });
+            }
+        }
+    }
+
+    // 1-4. Attested GenerateDataKey → (wrapped DEK for the envelope,
+    //      plaintext DEK for us).
+    let (ciphertext_blob_b64, dek) =
+        kms_generate_dek(parent_cid, parent_kms_proxy_port, &req.kms_key_arn).await?;
+
     // 5. Generate the EOA secp256k1 keypair INSIDE the enclave.
-    let mut sk_bytes = [0u8; 32];
+    let mut rng = rand::rngs::OsRng;
+    let mut sk_bytes = Zeroizing::new([0u8; 32]);
     // Keep looping until k256 accepts (it rejects the all-zero and
     // out-of-range values which are negligible-probability events).
-    let signing_key = loop {
-        rng.fill_bytes(&mut sk_bytes);
-        if let Ok(sk) = SigningKey::from_bytes((&sk_bytes).into()) {
-            break sk;
+    loop {
+        rng.fill_bytes(&mut sk_bytes[..]);
+        if SigningKey::from_bytes((&*sk_bytes).into()).is_ok() {
+            break;
         }
-    };
-    let pubkey = signing_key.verifying_key();
-    // 65-byte uncompressed pubkey: 0x04 || X(32) || Y(32). Ethereum
-    // address = keccak256(X || Y).last_20_bytes().
-    let uncompressed = pubkey.to_encoded_point(false);
-    let xy = &uncompressed.as_bytes()[1..];
-    let hash = Keccak256::digest(xy);
-    let addr_bytes = &hash[12..];
-    let owner_address = format!("0x{}", hex::encode(addr_bytes));
+    }
+    let (_addr, owner_address) = owner_address_of(&sk_bytes[..])?;
 
     // 6+7+8. Three paths, picked in priority order:
     //   v3 (enrolled_methods non-empty): device-bound, no password.
-    //       The EOA priv + auth_methods are AES-GCM-sealed under the
-    //       DEK. Every sign requires a fresh OIDC or Passkey proof.
     //   v2 (password present): password-bound XOR-share scheme.
-    //   v1 (neither): KMS-only legacy.
-    let envelope_blob = if !req.enrolled_methods.is_empty() {
-        // v3: seal (priv_key + auth_methods) under AES-GCM with the
-        // KMS-released DEK. No password share; consent at sign-time
-        // is enforced via the auth_proof against the enrolled list.
-        let mut auth_methods: Vec<envelope_v3::AuthMethod> = Vec::with_capacity(req.enrolled_methods.len());
-        for m in &req.enrolled_methods {
-            match m {
-                EnrolledMethod::Oidc { iss, sub } => {
-                    auth_methods.push(envelope_v3::AuthMethod::Oidc {
-                        iss: iss.clone(),
-                        sub: sub.clone(),
-                    });
-                }
-                EnrolledMethod::Passkey { cred_id_b64, cose_pubkey_b64 } => {
-                    let cred_id = B64
-                        .decode(cred_id_b64)
-                        .context("base64-decode enrolled cred_id")?;
-                    let cose = B64
-                        .decode(cose_pubkey_b64)
-                        .context("base64-decode enrolled cose")?;
-                    // Validate the COSE bytes parse — refuse a bad
-                    // enrolment at the gate rather than at first sign.
-                    webauthn_verification::CoseP256PublicKey::from_cose_cbor(&cose)
-                        .context("validate enrolled passkey COSE_Key")?;
-                    auth_methods.push(envelope_v3::AuthMethod::Passkey { cred_id, cose });
-                }
-            }
-        }
-
-        let mut dek_arr = [0u8; 32];
-        dek_arr.copy_from_slice(&dek[..]);
-        dek.zeroize();
+    //   v1 (neither): KMS-only legacy (refused when V1 is disabled).
+    let envelope_blob = if !auth_methods.is_empty() {
         let mut nonce_bytes = [0u8; password_derivation::GCM_NONCE_LEN];
         rng.fill_bytes(&mut nonce_bytes);
-
-        let blob = envelope_v3::seal(
-            &sk_bytes,
-            auth_methods,
-            &dek_arr,
-            &nonce_bytes,
-            &ciphertext_blob_b64,
-        )?;
-        sk_bytes.zeroize();
-        dek_arr.zeroize();
-        blob
+        envelope_v3::seal(&sk_bytes, auth_methods, &dek, &nonce_bytes, &ciphertext_blob_b64)?
     } else if let Some(password) = req.password.as_ref() {
         // v2: AES-256-GCM with K_aes = DEK XOR HKDF(password, salt).
         // Plaintext is the raw 32-byte private key (no hex encoding).
         let mut salt = [0u8; password_derivation::SALT_LEN];
         rng.fill_bytes(&mut salt);
         let k_user = password_derivation::derive_user_key(password.as_bytes(), &salt)?;
-        let mut dek_arr = [0u8; 32];
-        dek_arr.copy_from_slice(&dek[..]);
-        let k_aes = password_derivation::combine_keys(&dek_arr, &k_user);
-        dek.zeroize();
+        let k_aes = password_derivation::combine_keys(&dek, &k_user);
 
         let mut nonce_bytes = [0u8; password_derivation::GCM_NONCE_LEN];
         rng.fill_bytes(&mut nonce_bytes);
 
-        let ct_with_tag = password_derivation::aead_encrypt(&k_aes, &nonce_bytes, &sk_bytes)?;
-        sk_bytes.zeroize();
+        let ct_with_tag = password_derivation::aead_encrypt(&k_aes, &nonce_bytes, &sk_bytes[..])?;
 
         // Split ct from tag for the wire format.
         let tag_start = ct_with_tag.len() - password_derivation::GCM_TAG_LEN;
@@ -782,15 +751,12 @@ async fn process_generate_wallet(
         )
     } else {
         // v1: AES-256-CBC, KMS-only, plaintext is hex-encoded.
-        let pk_hex = format!("0x{}", hex::encode(sk_bytes));
-        sk_bytes.zeroize();
-        let plaintext_bytes = pk_hex.as_bytes();
+        let pk_hex = Zeroizing::new(format!("0x{}", hex::encode(&sk_bytes[..])));
 
         let mut iv = [0u8; 16];
         rng.fill_bytes(&mut iv);
-        let encryptor = Aes256CbcEnc::new(dek[..].into(), (&iv).into());
-        let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext_bytes);
-        dek.zeroize();
+        let encryptor = Aes256CbcEnc::new((&*dek).into(), (&iv).into());
+        let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(pk_hex.as_bytes());
 
         format!(
             "enc:v1:{}:{}:{}",
@@ -818,8 +784,8 @@ async fn process_generate_wallet(
 //   5. Seal (priv_key + enrolled_methods) as a new v3 envelope.
 //   6. Return the new blob + owner_address.
 //
-// The OLD envelope row stays untouched on disk — backend swaps in the
-// new blob in a single DB write so a failure mid-flight is recoverable.
+// Migration from v1 stays available even when `V1_SIGNING_ENABLED` is
+// false — it is the only way off v1.
 
 async fn serve_migrate(
     port: u32,
@@ -886,175 +852,17 @@ async fn process_migrate(
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<(String, String)> {
-    use k256::ecdsa::SigningKey;
-    use sha3::{Digest, Keccak256};
-
     if req.enrolled_methods.is_empty() {
         bail!("migrate requires at least one enrolled method on the new v3 envelope");
     }
 
     // ─── 1. Parse old envelope ───────────────────────────────────────
-    // We need the wrapped_dek out of the old blob so we can KMS-decrypt
-    // it. The wrapped_dek for v1 and v2 lives at the same position
-    // (first field after the prefix); the rest of the layout differs.
     let (old_wrapped_dek_b64, old_kind) = parse_old_envelope_prefix(&req.old_envelope_blob)?;
-
-    // ─── 2. KMS-Decrypt the OLD DEK ──────────────────────────────────
-    let (mut old_dek, _attestation_ts) = kms_decrypt_dek(
-        parent_cid,
-        parent_kms_proxy_port,
-        &old_wrapped_dek_b64,
-        &req.kms_key_arn,
-    )
-    .await?;
-    if old_dek.len() != 32 {
-        old_dek.zeroize();
-        bail!("old wrapped DEK has unexpected length {} (want 32)", old_dek.len());
+    if matches!(old_kind, OldEnvelopeKind::V2) && req.old_password.is_none() {
+        bail!("v2 → v3 migration requires the user's existing password");
     }
 
-    // ─── 3. Open the old envelope → raw priv key ─────────────────────
-    let mut priv_key: Vec<u8> = match old_kind {
-        OldEnvelopeKind::V1 => {
-            // v1 layout: enc:v1:<wrapped_dek>:<iv_hex>:<ct_hex>
-            // Plaintext is the hex-encoded private key.
-            let parts: Vec<&str> = req
-                .old_envelope_blob
-                .strip_prefix("enc:v1:")
-                .expect("strip prefix succeeded in parse_old_envelope_prefix")
-                .split(':')
-                .collect();
-            if parts.len() != 3 {
-                old_dek.zeroize();
-                bail!("malformed v1 envelope: expected 3 fields, got {}", parts.len());
-            }
-            let iv = hex::decode(parts[1].trim_start_matches("0x"))
-                .context("hex-decode v1 IV")?;
-            let ciphertext = hex::decode(parts[2].trim_start_matches("0x"))
-                .context("hex-decode v1 ciphertext")?;
-            let plaintext = envelope::decrypt(&old_dek, &iv, &ciphertext)?;
-            old_dek.zeroize();
-
-            let pk_hex = std::str::from_utf8(&plaintext)
-                .map_err(|_| anyhow!("v1 plaintext is not UTF-8"))?;
-            let pk_bytes = hex::decode(pk_hex.trim().trim_start_matches("0x"))
-                .context("hex-decode EOA private key from v1 plaintext")?;
-            if pk_bytes.len() != 32 {
-                bail!("v1 priv key has length {} (want 32)", pk_bytes.len());
-            }
-            pk_bytes
-        }
-        OldEnvelopeKind::V2 => {
-            // v2 layout: enc:v2:<wrapped_dek>:<salt_b64>:<nonce_hex>:<ct_hex>:<tag_hex>
-            // Plaintext is the raw 32-byte private key. Caller must
-            // supply the user's existing password to authorise the
-            // migration — without it the AES-GCM tag check fails.
-            let password = req
-                .old_password
-                .as_ref()
-                .ok_or_else(|| {
-                    old_dek.zeroize();
-                    anyhow!("v2 → v3 migration requires the user's existing password")
-                })?;
-            let parts: Vec<&str> = req
-                .old_envelope_blob
-                .strip_prefix("enc:v2:")
-                .expect("strip prefix succeeded in parse_old_envelope_prefix")
-                .split(':')
-                .collect();
-            if parts.len() != 5 {
-                old_dek.zeroize();
-                bail!("malformed v2 envelope: expected 5 fields, got {}", parts.len());
-            }
-            let salt = B64.decode(parts[1]).context("decode v2 salt")?;
-            if salt.len() != password_derivation::SALT_LEN {
-                old_dek.zeroize();
-                bail!("v2 salt length {} (want {})", salt.len(), password_derivation::SALT_LEN);
-            }
-            let k_user = password_derivation::derive_user_key(password.as_bytes(), &salt)?;
-            let mut dek_arr = [0u8; 32];
-            dek_arr.copy_from_slice(&old_dek[..]);
-            let k_aes = password_derivation::combine_keys(&dek_arr, &k_user);
-            old_dek.zeroize();
-
-            let nonce_bytes = hex::decode(parts[2].trim_start_matches("0x"))
-                .context("hex-decode v2 nonce")?;
-            if nonce_bytes.len() != password_derivation::GCM_NONCE_LEN {
-                bail!("v2 nonce length {} (want {})", nonce_bytes.len(), password_derivation::GCM_NONCE_LEN);
-            }
-            let mut nonce_arr = [0u8; 12];
-            nonce_arr.copy_from_slice(&nonce_bytes);
-
-            let mut ct = hex::decode(parts[3].trim_start_matches("0x"))
-                .context("hex-decode v2 ct")?;
-            let tag = hex::decode(parts[4].trim_start_matches("0x"))
-                .context("hex-decode v2 tag")?;
-            ct.extend_from_slice(&tag);
-
-            let pt = password_derivation::aead_decrypt(&k_aes, &nonce_arr, &ct)?;
-            if pt.len() != 32 {
-                bail!("v2 plaintext length {} (want 32 raw)", pt.len());
-            }
-            pt.to_vec()
-        }
-    };
-
-    // ─── 4. Derive owner address from the recovered priv key ─────────
-    let signing_key = SigningKey::from_bytes((&priv_key[..]).into())
-        .map_err(|e| {
-            priv_key.zeroize();
-            anyhow!("recovered priv key rejected by k256: {e}")
-        })?;
-    let pubkey = signing_key.verifying_key();
-    let uncompressed = pubkey.to_encoded_point(false);
-    let xy = &uncompressed.as_bytes()[1..];
-    let hash = Keccak256::digest(xy);
-    let addr_bytes = &hash[12..];
-    let owner_address = format!("0x{}", hex::encode(addr_bytes));
-
-    // ─── 5. KMS-GenerateDataKey for a fresh DEK ──────────────────────
-    let mut rng = rand::rngs::OsRng;
-    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
-        .context("RSA-2048 keygen for migrate KMS-recipient channel")?;
-    let rsa_pub = RsaPublicKey::from(&rsa_priv);
-    let rsa_pub_der = rsa_pub
-        .to_public_key_der()
-        .context("encode RSA pubkey")?
-        .to_vec();
-    let mut nonce = [0u8; 32];
-    rng.fill_bytes(&mut nonce);
-    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce)
-        .context("NSM attestation for migrate")?;
-
-    let kms_req = KmsGenerateDataKeyRequest {
-        attestation_doc_b64: B64.encode(&*attestation_doc),
-        kms_key_arn: req.kms_key_arn.clone(),
-    };
-    let kms_resp = kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
-        .await
-        .context("parent KMS GenerateDataKey round trip (migrate)")?;
-    let (new_wrapped_dek_b64, cfr_b64) = match kms_resp {
-        KmsGenerateDataKeyResponse::Ok {
-            ciphertext_blob_b64,
-            ciphertext_for_recipient_b64,
-        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
-        KmsGenerateDataKeyResponse::Err { reason } => {
-            priv_key.zeroize();
-            bail!("parent KMS GenerateDataKey returned error: {reason}");
-        }
-    };
-    let cfr = B64.decode(&cfr_b64).context("base64-decode CiphertextForRecipient")?;
-    let mut new_dek = cms_unwrap_data_key(&rsa_priv, &cfr)
-        .context("CMS unwrap of CiphertextForRecipient")?;
-    if new_dek.len() != 32 {
-        new_dek.zeroize();
-        priv_key.zeroize();
-        bail!("new DEK length {} (want 32)", new_dek.len());
-    }
-    let mut new_dek_arr = [0u8; 32];
-    new_dek_arr.copy_from_slice(&new_dek[..]);
-    new_dek.zeroize();
-
-    // ─── 6. Convert enrolled methods + seal as v3 ────────────────────
+    // Validate the new methods before touching KMS.
     let mut auth_methods: Vec<envelope_v3::AuthMethod> =
         Vec::with_capacity(req.enrolled_methods.len());
     for m in &req.enrolled_methods {
@@ -1075,22 +883,70 @@ async fn process_migrate(
         }
     }
 
-    let mut sk_arr = [0u8; 32];
-    sk_arr.copy_from_slice(&priv_key[..]);
-    priv_key.zeroize();
+    // ─── 2. KMS-Decrypt the OLD DEK ──────────────────────────────────
+    let (old_dek, _attestation_ts) = kms_decrypt_dek(
+        parent_cid,
+        parent_kms_proxy_port,
+        &old_wrapped_dek_b64,
+        &req.kms_key_arn,
+    )
+    .await?;
 
+    // ─── 3. Open the old envelope → raw priv key ─────────────────────
+    let priv_key: Zeroizing<[u8; 32]> = match old_kind {
+        OldEnvelopeKind::V1 => {
+            // v1 layout: enc:v1:<wrapped_dek>:<iv_hex>:<ct_hex>. Every
+            // failure (layout included) is the single opaque v1 error.
+            let rest = req.old_envelope_blob.strip_prefix("enc:v1:").unwrap_or("");
+            let parts: Vec<&str> = rest.split(':').collect();
+            let (iv_hex, ct_hex) = if parts.len() == 3 {
+                (parts[1], parts[2])
+            } else {
+                ("", "")
+            };
+            envelope::open_v1_private_key(&old_dek, iv_hex, ct_hex)?
+        }
+        OldEnvelopeKind::V2 => {
+            // v2 layout: enc:v2:<wrapped_dek>:<salt_b64>:<nonce_hex>:<ct_hex>:<tag_hex>
+            // Caller must supply the user's existing password to
+            // authorise the migration — without it the AES-GCM tag
+            // check fails.
+            let password = req
+                .old_password
+                .as_ref()
+                .ok_or_else(|| anyhow!("v2 → v3 migration requires the user's existing password"))?;
+            let parts: Vec<&str> = req
+                .old_envelope_blob
+                .strip_prefix("enc:v2:")
+                .unwrap_or("")
+                .split(':')
+                .collect();
+            if parts.len() != 5 {
+                bail!("malformed v2 envelope: expected 5 fields, got {}", parts.len());
+            }
+            let dek_arr = dek_to_array(old_dek)?;
+            open_v2(&dek_arr, password.as_bytes(), parts[1], parts[2], parts[3], parts[4])?
+        }
+    };
+
+    // ─── 4. Derive owner address from the recovered priv key ─────────
+    let (_addr, owner_address) = owner_address_of(&priv_key[..])?;
+
+    // ─── 5. KMS-GenerateDataKey for a fresh DEK ──────────────────────
+    let (new_wrapped_dek_b64, new_dek) =
+        kms_generate_dek(parent_cid, parent_kms_proxy_port, &req.kms_key_arn).await?;
+
+    // ─── 6. Seal as v3 ───────────────────────────────────────────────
     let mut new_nonce = [0u8; password_derivation::GCM_NONCE_LEN];
-    rng.fill_bytes(&mut new_nonce);
+    rand::rngs::OsRng.fill_bytes(&mut new_nonce);
 
     let new_blob = envelope_v3::seal(
-        &sk_arr,
+        &priv_key,
         auth_methods,
-        &new_dek_arr,
+        &new_dek,
         &new_nonce,
         &new_wrapped_dek_b64,
     )?;
-    sk_arr.zeroize();
-    new_dek_arr.zeroize();
 
     info!(owner_address = %owner_address, "envelope migrated to v3 inside enclave");
     Ok((new_blob, owner_address))
@@ -1100,15 +956,13 @@ async fn process_migrate(
 //
 // Adds a new AuthMethod to an already-v3 envelope. Same crypto shape
 // as migrate — KMS-Decrypt old DEK, unwrap, verify consent, KMS-
-// GenerateDataKey new DEK, seal — but the input side is different:
+// GenerateDataKey new DEK, seal — but:
 //   1. Input is v3 (not v1/v2), so we go straight through envelope_v3.
 //   2. Consent is `auth_proof` against an already-enrolled method,
-//      NOT a v2 password. This is the difference that lets a user who
-//      already has (say) Google enrol a passkey for a second device.
+//      over the domain-separated bound challenge (see reseal_helpers),
+//      NOT a v2 password.
 //   3. Duplicate check: refuse to append a method that would collide
-//      with an existing one (same cred_id, or same iss+sub). Silent
-//      appends would inflate the methods list without adding real
-//      recovery.
+//      with an existing one (same cred_id, or same iss+sub).
 
 async fn serve_reseal(
     port: u32,
@@ -1176,162 +1030,96 @@ async fn process_reseal_v3(
     parent_cid: u32,
     parent_kms_proxy_port: u32,
 ) -> Result<(String, String)> {
-    use k256::ecdsa::SigningKey;
-    use sha3::{Digest, Keccak256};
-
-    // ── 1. Parse the old v3 envelope ─────────────────────────────────
+    // ── 1. Parse inputs that need no secrets ─────────────────────────
     let env = envelope_v3::EnvelopeV3::parse(&req.old_envelope_blob)
         .context("parse old v3 envelope blob")?;
     let wrapped_dek_b64 = B64.encode(&env.wrapped_dek);
+    let server_nonce = parse_hex32(&req.prehashed_hex, "challenge (prehashed_hex)")?;
+    let new_method = enrolled_to_authmethod(&req.new_method)?;
 
     // ── 2. KMS-Decrypt the OLD DEK (Recipient-attested) ───────────────
-    let (mut old_dek, attestation_ts) = kms_decrypt_dek(
+    let (old_dek, attestation_ts) = kms_decrypt_dek(
         parent_cid,
         parent_kms_proxy_port,
         &wrapped_dek_b64,
         &req.kms_key_arn,
     )
     .await?;
-    if old_dek.len() != 32 {
-        old_dek.zeroize();
-        bail!(
-            "old wrapped DEK has unexpected length {} (want 32)",
-            old_dek.len()
-        );
-    }
-    let mut old_dek_arr = [0u8; 32];
-    old_dek_arr.copy_from_slice(&old_dek[..]);
-    old_dek.zeroize();
+    let old_dek_arr = dek_to_array(old_dek)?;
 
     // ── 3. Open the envelope → (priv_key, existing_methods) ──────────
     let (priv_key, existing_methods) = envelope_v3::open(&env, &old_dek_arr)?;
-    old_dek_arr.zeroize();
+    drop(old_dek_arr);
     if existing_methods.is_empty() {
         bail!("existing envelope has no enrolled methods — reseal would corrupt the wallet");
     }
 
-    // ── 4. Parse challenge (prehashed_hex) ───────────────────────────
-    let hash_clean = req.prehashed_hex.trim_start_matches("0x");
-    let hash_bytes = hex::decode(hash_clean).context("hex-decode challenge")?;
-    if hash_bytes.len() != 32 {
-        bail!(
-            "challenge (prehashed_hex) must be 32 bytes, got {}",
-            hash_bytes.len()
-        );
-    }
-    let mut hash_arr = [0u8; 32];
-    hash_arr.copy_from_slice(&hash_bytes);
+    // ── 4. Owner address (derived in-enclave; part of the challenge) ─
+    let (owner_raw, owner_address) = owner_address_of(&priv_key[..])?;
 
     // ── 5. Verify consent proof against EXISTING methods ─────────────
-    // Same `verify_auth_proof` used on the sign path. Only a user who
-    // could already sign for this wallet can add or remove methods.
-    //
-    // Per-project policy: resolve the same signed accept-list bundle
-    // used on the sign path. Without this, a partner-hosted origin
-    // (e.g. Blockfinax's www.blockfinax.com) fails the default-policy
-    // origin check even though its signed bundle is valid. Never
-    // hard-errors — a broken bundle silently degrades to the hardcoded
-    // default, so this feature can't take down Rift users.
-    let per_project_policy = match (
+    // Same `verify_auth_proof` used on the sign path, but over the
+    // domain-separated bound challenge. Legacy (raw prehashed_hex)
+    // proofs are accepted only while neither the enclave constant nor
+    // the project's signed bundle requires bound challenges.
+    let per_project_policy = resolve_project_policy(
         req.signed_config_json.as_deref(),
         req.signed_config_signature_b64.as_deref(),
         req.project_id.as_deref(),
-    ) {
-        (Some(json), Some(sig), Some(pid)) => {
-            project_config::resolve_policy(json.as_bytes(), sig, attestation_ts, pid)
-                .unwrap_or(None)
-        }
-        _ => None,
-    };
-
-    verify_auth_proof(
-        &req.auth_proof,
-        &existing_methods,
-        &hash_arr,
         attestation_ts,
-        per_project_policy.as_ref(),
-    )
+    );
+    let require_bound = reseal_requires_bound(
+        per_project_policy
+            .as_ref()
+            .map(|p| p.require_bound_reseal)
+            .unwrap_or(false),
+    );
+    let bound_challenge = bound_reseal_challenge(&owner_raw, &server_nonce, &new_method);
+    let mode = verify_reseal_consent(&bound_challenge, &server_nonce, require_bound, |c| {
+        verify_auth_proof(
+            &req.auth_proof,
+            &existing_methods,
+            c,
+            attestation_ts,
+            per_project_policy.as_ref(),
+        )
+    })
     .context("reseal-v3 auth_proof verification failed")?;
+    match mode {
+        crate::reseal_helpers::ResealChallengeMode::Bound => {
+            info!("reseal consent verified over bound challenge")
+        }
+        crate::reseal_helpers::ResealChallengeMode::Legacy => warn!(
+            "reseal consent verified over LEGACY unbound challenge — client must migrate to rift-reseal-v1"
+        ),
+    }
 
-    // ── 6. Convert new_method + duplicate check ──────────────────────
-    let new_method = enrolled_to_authmethod(&req.new_method)?;
+    // ── 6. Duplicate check ───────────────────────────────────────────
     if is_duplicate_method(&existing_methods, &new_method) {
         bail!("new_method is already enrolled — refusing to append a duplicate");
     }
 
-    // ── 7. Derive owner address (sanity — never changes) ────────────
-    let signing_key = SigningKey::from_bytes((&priv_key[..]).into())
-        .map_err(|e| anyhow!("recovered priv key rejected by k256: {e}"))?;
-    let pubkey = signing_key.verifying_key();
-    let uncompressed = pubkey.to_encoded_point(false);
-    let xy = &uncompressed.as_bytes()[1..];
-    let hash = Keccak256::digest(xy);
-    let addr_bytes = &hash[12..];
-    let owner_address = format!("0x{}", hex::encode(addr_bytes));
+    // ── 7. KMS-GenerateDataKey → fresh DEK ───────────────────────────
+    let (new_wrapped_dek_b64, new_dek) =
+        kms_generate_dek(parent_cid, parent_kms_proxy_port, &req.kms_key_arn).await?;
 
-    // ── 8. KMS-GenerateDataKey → fresh DEK ───────────────────────────
-    let mut rng = rand::rngs::OsRng;
-    let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)
-        .context("RSA-2048 keygen for reseal KMS-recipient channel")?;
-    let rsa_pub = RsaPublicKey::from(&rsa_priv);
-    let rsa_pub_der = rsa_pub
-        .to_public_key_der()
-        .context("encode RSA pubkey")?
-        .to_vec();
-    let mut nonce_buf = [0u8; 32];
-    rng.fill_bytes(&mut nonce_buf);
-    let attestation_doc = attestation::attest(&rsa_pub_der, &nonce_buf)
-        .context("NSM attestation for reseal")?;
-    let kms_req = KmsGenerateDataKeyRequest {
-        attestation_doc_b64: B64.encode(&*attestation_doc),
-        kms_key_arn: req.kms_key_arn.clone(),
-    };
-    let kms_resp =
-        kms_generate_data_key_round_trip(parent_cid, parent_kms_proxy_port, kms_req)
-            .await
-            .context("parent KMS GenerateDataKey round trip (reseal)")?;
-    let (new_wrapped_dek_b64, cfr_b64) = match kms_resp {
-        KmsGenerateDataKeyResponse::Ok {
-            ciphertext_blob_b64,
-            ciphertext_for_recipient_b64,
-        } => (ciphertext_blob_b64, ciphertext_for_recipient_b64),
-        KmsGenerateDataKeyResponse::Err { reason } => {
-            bail!("parent KMS GenerateDataKey returned error: {reason}");
-        }
-    };
-    let cfr = B64
-        .decode(&cfr_b64)
-        .context("base64-decode CiphertextForRecipient")?;
-    let mut new_dek = cms_unwrap_data_key(&rsa_priv, &cfr)
-        .context("CMS unwrap of CiphertextForRecipient")?;
-    if new_dek.len() != 32 {
-        new_dek.zeroize();
-        bail!("new DEK length {} (want 32)", new_dek.len());
-    }
-    let mut new_dek_arr = [0u8; 32];
-    new_dek_arr.copy_from_slice(&new_dek[..]);
-    new_dek.zeroize();
-
-    // ── 9. Append + seal fresh v3 envelope ───────────────────────────
+    // ── 8. Append + seal fresh v3 envelope ───────────────────────────
     let mut merged_methods = existing_methods;
     merged_methods.push(new_method);
 
-    let mut sk_arr = [0u8; 32];
+    let mut sk_arr = Zeroizing::new([0u8; 32]);
     sk_arr.copy_from_slice(&priv_key[..]);
-    // `priv_key` (Zeroizing) drops at fn end — no explicit clear.
 
     let mut new_nonce = [0u8; password_derivation::GCM_NONCE_LEN];
-    rng.fill_bytes(&mut new_nonce);
+    rand::rngs::OsRng.fill_bytes(&mut new_nonce);
 
     let new_blob = envelope_v3::seal(
         &sk_arr,
         merged_methods,
-        &new_dek_arr,
+        &new_dek,
         &new_nonce,
         &new_wrapped_dek_b64,
     )?;
-    sk_arr.zeroize();
-    new_dek_arr.zeroize();
 
     info!(
         owner_address = %owner_address,
@@ -1378,6 +1166,73 @@ fn parse_old_envelope_prefix(blob: &str) -> Result<(String, OldEnvelopeKind)> {
     } else {
         bail!("envelope blob has no recognized version prefix")
     }
+}
+
+// ─── Health / canary pipeline (port 5010) ───────────────────────────
+
+async fn serve_health(port: u32, parent_cid: u32, parent_kms_proxy_port: u32) -> Result<()> {
+    let addr = VsockAddr::new(u32::MAX, port);
+    let mut listener = VsockListener::bind(addr).context("vsock bind failed (health)")?;
+    info!(port = port, "listening for health requests on vsock");
+    loop {
+        let (mut stream, peer) = listener
+            .accept()
+            .await
+            .context("vsock accept failed (health)")?;
+        let span = info_span!("health-conn", peer_cid = peer.cid());
+        tokio::spawn(
+            async move {
+                let result = async {
+                    let req = read_frame::<HealthRequest>(&mut stream).await?;
+                    let resp = match process_health(req, parent_cid, parent_kms_proxy_port).await {
+                        Ok(r) => r,
+                        Err(e) => HealthResponse::Err { reason: format!("{e:#}") },
+                    };
+                    write_frame(&mut stream, &resp).await
+                }
+                .await;
+                if let Err(e) = result {
+                    warn!(error = ?e, "health handler aborted");
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+async fn process_health(
+    req: HealthRequest,
+    parent_cid: u32,
+    parent_kms_proxy_port: u32,
+) -> Result<HealthResponse> {
+    let pcr0 = hex::encode(attestation::describe_pcr0()?);
+    let kms_checked = match req.kms_key_arn.as_deref() {
+        Some(arn) if !arn.is_empty() => {
+            // Proves KMS accepts THIS image's attestation on BOTH paths
+            // the wallet depends on: GenerateDataKey (new wallets) and
+            // Decrypt (every signature — this is the statement whose
+            // ImageSha384 condition rotation edits). Round trip a fresh
+            // DEK through both and compare. Both copies are wiped on
+            // drop; the wrapped blob is discarded.
+            let (wrapped_b64, dek) = kms_generate_dek(parent_cid, parent_kms_proxy_port, arn)
+                .await
+                .context("health: attested KMS GenerateDataKey")?;
+            let (dek_again, _ts) =
+                kms_decrypt_dek(parent_cid, parent_kms_proxy_port, &wrapped_b64, arn)
+                    .await
+                    .context("health: attested KMS Decrypt")?;
+            if dek_again.as_slice() != dek.as_slice() {
+                bail!("health: KMS Decrypt returned a different data key than GenerateDataKey");
+            }
+            true
+        }
+        _ => false,
+    };
+    Ok(HealthResponse::Ok {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pcr0,
+        kms_checked,
+    })
 }
 
 // ─── Vsock framing + KMS proxy round-trip ────────────────────────────
@@ -1432,7 +1287,8 @@ async fn read_frame<T: for<'de> serde::Deserialize<'de>>(
     if len > 1 << 20 {
         bail!("frame too large: {len} bytes (max 1 MiB)");
     }
-    let mut body = vec![0u8; len];
+    // The raw frame can contain a v2 password: wipe it after decoding.
+    let mut body = Zeroizing::new(vec![0u8; len]);
     stream.read_exact(&mut body).await.context("read frame body")?;
     let decoded: T = serde_json::from_slice(&body).context("JSON decode")?;
     Ok(decoded)
@@ -1440,7 +1296,9 @@ async fn read_frame<T: for<'de> serde::Deserialize<'de>>(
 
 async fn write_frame<T: serde::Serialize>(stream: &mut VsockStream, value: &T) -> Result<()> {
     let body = serde_json::to_vec(value).context("JSON encode")?;
-    let len = (body.len() as u32).to_be_bytes();
+    let len = u32::try_from(body.len())
+        .context("frame body too large to encode")?
+        .to_be_bytes();
     stream.write_all(&len).await.context("write length prefix")?;
     stream.write_all(&body).await.context("write frame body")?;
     stream.flush().await.context("flush")?;
@@ -1455,9 +1313,9 @@ async fn write_frame<T: serde::Serialize>(stream: &mut VsockStream, value: &T) -
 // length form, so we use openssl (statically vendored) for this step.
 // Same code path as the AWS Nitro Enclaves C SDK
 // (`CMS_decrypt(cms_info, NULL, pkey, NULL, plaintext_bio, 0)`).
-fn cms_unwrap_data_key(rsa_priv: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
+fn cms_unwrap_data_key(rsa_priv: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     // Convert our rsa::RsaPrivateKey → openssl::PKey via PKCS#8 DER.
-    // Two crates, one byte-array stop in between.
+    // (`SecretDocument` zeroizes the DER on drop.)
     let pkcs8 = rsa_priv
         .to_pkcs8_der()
         .context("encode RSA private key as PKCS#8 DER")?;
@@ -1467,9 +1325,9 @@ fn cms_unwrap_data_key(rsa_priv: &RsaPrivateKey, ciphertext: &[u8]) -> Result<Ve
     // Parse + decrypt the CMS structure. openssl handles BER + the
     // KeyTransRecipientInfo + RSA-OAEP unwrap + content decryption
     // in one call.
-    let mut cms = CmsContentInfo::from_der(ciphertext).context("parse CMS ContentInfo")?;
+    let cms = CmsContentInfo::from_der(ciphertext).context("parse CMS ContentInfo")?;
     let plaintext = cms
         .decrypt_without_cert_check(&pkey)
         .context("CMS_decrypt of EnvelopedData")?;
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }

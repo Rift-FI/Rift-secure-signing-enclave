@@ -23,8 +23,12 @@
 //! crypto modules (`signing`, `envelope`, `protocol`) during local
 //! development, but `main()` exits immediately with a friendly hint.
 
+// Off-Linux builds compile only the portable modules (vsock_server is
+// Linux-only), so most wire types look unused there. Linux builds keep
+// full dead-code checking.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 mod envelope;
-mod envelope_v2;
 mod envelope_v3;
 mod oidc_verification;
 mod password_derivation;
@@ -64,6 +68,11 @@ mod linux_main {
     /// methods without changing the EOA key). Separate loop so a
     /// stuck reseal cannot block signing or account creation.
     pub const ENCLAVE_RESEAL_PORT: u32 = 5009;
+    /// Health / canary port. Answers with the enclave's own PCR0 (read
+    /// from the NSM) and, optionally, proves an attested KMS
+    /// GenerateDataKey round trip works. No secret ever leaves the
+    /// enclave on this port.
+    pub const ENCLAVE_HEALTH_PORT: u32 = 5010;
 
     pub async fn run() -> anyhow::Result<()> {
         tracing_subscriber::fmt()
@@ -88,6 +97,7 @@ mod linux_main {
             ENCLAVE_GENERATE_WALLET_PORT,
             ENCLAVE_MIGRATE_PORT,
             ENCLAVE_RESEAL_PORT,
+            ENCLAVE_HEALTH_PORT,
             PARENT_CID,
             PARENT_KMS_PROXY_PORT,
         )
